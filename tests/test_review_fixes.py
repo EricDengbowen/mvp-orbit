@@ -39,9 +39,10 @@ def _join(client: TestClient, alias: str, channel: str = "team", approver_token:
 def test_rejoin_of_existing_alias_requires_approval(tmp_path):
     client, _ = _build_client(tmp_path)
     alice = _join(client, "alice")
+    _join(client, "bob", approver_token=alice["member_token"])
 
-    # Claiming an existing member's alias must NOT hand out a token —
-    # /api/join is unauthenticated and 'alice' is the channel admin.
+    # With other members present, claiming an existing member's alias must NOT
+    # hand out a token — /api/join is unauthenticated and 'alice' is the admin.
     rejoin = client.post("/api/join", json={"alias": "alice", "channel": "team"}).json()
     assert rejoin["status"] == "pending"
     assert rejoin["member_token"] is None
@@ -142,3 +143,29 @@ def test_command_request_serialization_omits_none_fields():
     payload = request.model_dump(mode="json", exclude_none=True)
     assert "claim_timeout_sec" not in payload  # old hubs use extra="forbid"
     assert payload["env_patch"] == {}
+
+
+def test_sole_member_channel_can_reenroll_itself(tmp_path):
+    client, _ = _build_client(tmp_path)
+    _join(client, "alice", channel="solo")
+    rejoin = client.post("/api/join", json={"alias": "alice", "channel": "solo"}).json()
+    assert rejoin["status"] == "approved"  # nobody else could approve; not a lockout
+    assert rejoin["member_token"]
+    # A different alias still needs approval even on a single-member channel.
+    other = client.post("/api/join", json={"alias": "mallory", "channel": "solo"}).json()
+    assert other["status"] == "pending"
+
+
+def test_approved_join_request_token_is_single_use(tmp_path):
+    client, _ = _build_client(tmp_path)
+    alice = _join(client, "alice")
+    pending = client.post("/api/join", json={"alias": "bob", "channel": "team"}).json()
+    client.post(f"/api/join-requests/{pending['request_id']}/approve", headers=_auth(alice["member_token"]))
+
+    first = client.get(f"/api/join-requests/{pending['request_id']}").json()
+    assert first["status"] == "approved"
+    assert first["member_token"]
+
+    replay = client.get(f"/api/join-requests/{pending['request_id']}").json()
+    assert replay["status"] == "approved"
+    assert replay["member_token"] is None  # the request id is not a reusable credential

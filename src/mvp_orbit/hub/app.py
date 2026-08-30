@@ -156,7 +156,7 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
             )
 
     async def _unclaimed_reaper_loop() -> None:
-        interval = max(1.0, min(claim_timeout_sec / 2.0, 10.0))
+        interval = max(1.0, min(claim_timeout_sec / 2.0, 10.0)) if claim_timeout_sec > 0 else 10.0
         while True:
             await asyncio.sleep(interval)
             await asyncio.to_thread(
@@ -170,7 +170,9 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
         tasks = []
         if cleanup_enabled:
             tasks.append(asyncio.create_task(_channel_cleanup_loop()))
-        if claim_timeout_sec > 0:
+        # The reaper covers two independent features: unclaimed-work timeouts
+        # and lost-client recovery. Disabling one must not disable the other.
+        if claim_timeout_sec > 0 or client_offline_sec > 0:
             tasks.append(asyncio.create_task(_unclaimed_reaper_loop()))
         try:
             yield

@@ -510,18 +510,25 @@ class ClientService:
         return ShellSessionLease.model_validate(response.json())
 
     def _post_terminal_event(self, client: httpx.Client, event: ClientEvent, *, what: str, key: str) -> None:
-        # Terminal events are what unblock initiators; a hub blip at exactly
-        # this moment must not lose them, so retry for a while. If the client
-        # itself dies the hub's client-lost reaper takes over.
-        for attempt, delay in enumerate((0.0, 2.0, 4.0, 8.0, 15.0, 15.0, 15.0, 30.0), start=1):
-            if delay:
-                time.sleep(delay)
+        # Terminal events are what unblock initiators, so retry until delivered:
+        # a bounded budget would leave a window where the hub outage outlasts
+        # the retries, our reconnect then refreshes last_seen_at, and the
+        # client-lost reaper never fires — the record would hang RUNNING
+        # forever. If this process dies instead, heartbeats stop and the
+        # reaper resolves it. Worker threads are daemonic, so an exiting
+        # client does not linger on this loop.
+        attempt = 0
+        delay = 1.0
+        while True:
+            attempt += 1
             try:
                 self._post_client_events(client, [event])
                 return
             except Exception as exc:
-                log_kv(logger, logging.WARNING, f"{what}.exit_post_failed", client_id=self.client_id, key=key, error=exc.__class__.__name__, attempt=attempt)
-        log_kv(logger, logging.ERROR, f"{what}.exit_post_lost", client_id=self.client_id, key=key)
+                level = logging.WARNING if attempt % 5 == 1 else logging.DEBUG
+                log_kv(logger, level, f"{what}.exit_post_failed", client_id=self.client_id, key=key, error=exc.__class__.__name__, attempt=attempt)
+                time.sleep(delay)
+                delay = min(30.0, delay * 2)
 
     def _post_client_events(self, client: httpx.Client, events: list[ClientEvent]) -> None:
         if not events:

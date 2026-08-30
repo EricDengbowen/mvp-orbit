@@ -388,6 +388,13 @@ def cmd_join(args: argparse.Namespace) -> int:
             print(f"join request still pending: {request_id}", file=sys.stderr)
             return 124
 
+    if not payload.get("member_token"):
+        print(
+            "[orbit] join approved but the credential was already issued to an earlier poll of this request — run `orbit join` again",
+            file=sys.stderr,
+        )
+        return 1
+
     config.hub.url = host
     config.client.id = alias
     config.auth.member_token = payload["member_token"]
@@ -949,12 +956,25 @@ def _daemonize_and_supervise(config_path: str) -> int:
     # does) segfaults the child on macOS — "crashed on child side of fork".
     log_path, pid_path = _daemon_paths(config_path)
     if pid_path.exists():
+        content = pid_path.read_text().strip()
         try:
-            existing = int(pid_path.read_text().strip())
-            os.kill(existing, 0)
-            raise RuntimeError(f"daemon already running (pid {existing}); stop it with `kill {existing}` first")
-        except (ValueError, ProcessLookupError, PermissionError):
+            existing = int(content)
+        except ValueError:
+            # A "starting" placeholder: either a concurrent invocation mid-spawn
+            # (fresh — refuse, do NOT unlink its reservation) or debris from a
+            # crash before the pid was written (old — clean up).
+            if time.time() - pid_path.stat().st_mtime < 60.0:
+                raise RuntimeError(f"a daemon is already starting (pidfile {pid_path}); retry shortly") from None
             pid_path.unlink(missing_ok=True)
+        else:
+            try:
+                os.kill(existing, 0)
+            except ProcessLookupError:
+                pid_path.unlink(missing_ok=True)
+            except PermissionError:
+                raise RuntimeError(f"daemon already running (pid {existing}, owned by another user)") from None
+            else:
+                raise RuntimeError(f"daemon already running (pid {existing}); stop it with `kill {existing}` first")
 
     try:
         # Atomically reserve the pidfile so two concurrent `join --daemon`

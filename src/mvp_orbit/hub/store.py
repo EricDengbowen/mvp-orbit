@@ -252,6 +252,7 @@ class HubStore:
             "ALTER TABLE clients ADD COLUMN stream_connected INTEGER",
             "ALTER TABLE channel_members ADD COLUMN role TEXT NOT NULL DEFAULT 'member'",
             "ALTER TABLE member_tokens ADD COLUMN alias TEXT",
+            "ALTER TABLE join_requests ADD COLUMN token_issued_at TEXT",
         ):
             try:
                 self._conn.execute(statement)
@@ -297,12 +298,33 @@ class HubStore:
                     expires_at=token.expires_at,
                 )
 
-            # NOTE deliberately no unauthenticated fast path for an existing
-            # alias: /api/join is anonymous, so handing out a token because the
-            # caller *claims* a member's alias would let anyone who knows a
-            # channel name + alias mint that member's credentials (an admin's,
-            # since roles exist). Re-enrollment goes through approval like any
-            # other join; membership and role are preserved on approval.
+            # NOTE deliberately no general unauthenticated fast path for an
+            # existing alias: /api/join is anonymous, so handing out a token
+            # because the caller *claims* a member's alias would let anyone who
+            # knows a channel name + alias mint that member's credentials (an
+            # admin's, since roles exist). Re-enrollment goes through approval
+            # like any other join; membership and role are preserved.
+            #
+            # Sole exception: a single-member channel re-enrolling its only
+            # member. Nobody else could approve it (pure lockout), and an
+            # attacker who knows that channel+alias pair could equally wait for
+            # the empty channel to be pruned and take it over fresh.
+            if self._channel_member_count_locked(channel_id) == 1:
+                sole = self._conn.execute(
+                    "SELECT alias FROM channel_members WHERE channel_id = ?",
+                    (channel_id,),
+                ).fetchone()
+                if sole is not None and str(sole["alias"]) == alias:
+                    token = self._issue_token_locked(channel_id, alias=alias)
+                    log_kv(logger, logging.INFO, "join.sole_member_rejoined", channel_id=channel_id, alias=alias)
+                    return JoinResponse(
+                        status=JoinRequestStatus.APPROVED,
+                        alias=alias,
+                        channel_id=channel_id,
+                        member_token=token.member_token,
+                        expires_at=token.expires_at,
+                    )
+
             now = utc_now()
             self._conn.execute(
                 """
@@ -325,15 +347,25 @@ class HubStore:
                 return None
             record = self._row_to_join_approval(dict(row))
             if record.status == JoinRequestStatus.APPROVED:
-                token = self._issue_token_locked(record.channel_id, alias=record.alias)
-                return JoinResponse(
-                    status=record.status,
-                    alias=record.alias,
-                    channel_id=record.channel_id,
-                    request_id=record.request_id,
-                    member_token=token.member_token,
-                    expires_at=token.expires_at,
-                )
+                # This endpoint is anonymous, so an approved request id must be
+                # a single-use credential: mint the token exactly once. Anyone
+                # replaying the id later (e.g. from a logged URL) gets the
+                # status but no token.
+                if row["token_issued_at"] is None:
+                    token = self._issue_token_locked(record.channel_id, alias=record.alias)
+                    self._conn.execute(
+                        "UPDATE join_requests SET token_issued_at = ? WHERE request_id = ?",
+                        (utc_now().isoformat(), request_id),
+                    )
+                    return JoinResponse(
+                        status=record.status,
+                        alias=record.alias,
+                        channel_id=record.channel_id,
+                        request_id=record.request_id,
+                        member_token=token.member_token,
+                        expires_at=token.expires_at,
+                    )
+                log_kv(logger, logging.WARNING, "join.token_replay_blocked", request_id=request_id, alias=record.alias)
             return JoinResponse(status=record.status, alias=record.alias, channel_id=record.channel_id, request_id=record.request_id)
 
     def list_join_requests(self, channel_id: str, status_filter: JoinRequestStatus | None = None) -> list[JoinApprovalRecord]:
