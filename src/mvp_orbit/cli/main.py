@@ -351,6 +351,37 @@ def cmd_join(args: argparse.Namespace) -> int:
     host = args.host or getattr(args, "hub_url", None) or config.hub.resolved_url()
     alias = args.alias or config.client.id or getpass.getuser()
     channel = args.channel
+
+    # Restarting with valid saved credentials must not require a fresh join
+    # (which needs member approval since re-enrollment was hardened): reuse
+    # the token and go straight to the client loop.
+    if (
+        not getattr(args, "force_rejoin", False)
+        and config.auth.member_token
+        and config.auth.expires_at is not None
+        and config.auth.expires_at > utc_now()
+        and config.client.id == alias
+        and (args.host is None or config.hub.url == args.host)
+    ):
+        print(
+            json.dumps(
+                {
+                    "status": "already-enrolled",
+                    "alias": alias,
+                    "host": config.hub.resolved_url(),
+                    "token_expires_at": config.auth.expires_at.isoformat(),
+                    "note": "reusing saved credentials; pass --force-rejoin to request fresh ones",
+                    "started": not args.no_start,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if args.no_start:
+            return 0
+        if getattr(args, "daemon", False):
+            return _daemonize_and_supervise(config_path)
+        return _run_client_loop(config)
     if not (args.host and args.alias and channel):
         wizard = SetupWizard(
             "ORBIT JOIN",
@@ -1162,6 +1193,7 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--no-wait", action="store_true")
     join.add_argument("--no-start", action="store_true", help="join and save config without starting the client loop")
     join.add_argument("--daemon", action="store_true", help="run the client loop as a supervised background daemon (auto-restart, log under ~/.local/state/mvp-orbit)")
+    join.add_argument("--force-rejoin", action="store_true", help="request fresh credentials even when valid saved ones exist (needs member approval)")
     join.set_defaults(func=cmd_join)
 
     status = sub.add_parser("status", help="show this machine's client state (local, no token needed)")

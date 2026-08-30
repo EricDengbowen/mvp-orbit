@@ -238,3 +238,29 @@ def test_terminal_retry_stops_on_shutdown(tmp_path):
     time.sleep(1.5)  # let it fail at least once and enter its wait
     service._shutdown.set()
     assert done.wait(timeout=10.0)  # the retry loop must exit promptly on shutdown
+
+
+def test_join_reuses_valid_saved_credentials(tmp_path, monkeypatch, capsys):
+    from datetime import timedelta as _td
+
+    from mvp_orbit.cli import main as cli_main
+    from mvp_orbit.config import AuthConfig, ClientConfig, HubConfig, OrbitConfig, save_config
+
+    config_path = tmp_path / "config.toml"
+    save_config(
+        OrbitConfig(
+            hub=HubConfig(url="http://hub.example"),
+            auth=AuthConfig(member_token="tok", expires_at=utc_now() + _td(days=1)),
+            client=ClientConfig(id="me"),
+        ),
+        config_path,
+    )
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+
+    def _no_network(*a, **k):
+        raise AssertionError("join must not hit the network when saved credentials are valid")
+
+    monkeypatch.setattr(cli_main, "_post_join_with_retry", _no_network)
+    assert cli_main.main(["join", "--alias", "me", "--channel", "team", "--no-start"]) == 0
+    out = capsys.readouterr().out
+    assert "already-enrolled" in out
