@@ -27,7 +27,7 @@ def _join(client: TestClient, alias: str, channel: str = "test-channel", approve
     if payload["status"] == "pending" and approver_token is not None:
         approved = client.post(f"/api/join-requests/{payload['request_id']}/approve", headers=_auth(approver_token))
         assert approved.status_code == 200
-        completed = client.get(f"/api/join-requests/{payload['request_id']}", params={"secret": payload["claim_secret"]})
+        completed = client.get(f"/api/join-requests/{payload['request_id']}", headers={"X-Orbit-Claim": payload["claim_secret"]})
         assert completed.status_code == 200
         payload = completed.json()
     assert payload["status"] == "approved"
@@ -312,7 +312,7 @@ def test_client_foreground_prompt_can_approve_join_request(tmp_path):
     deadline = time.time() + 5.0
     payload = {}
     while time.time() < deadline:
-        completed = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": pending["claim_secret"]})
+        completed = client.get(f"/api/join-requests/{pending['request_id']}", headers={"X-Orbit-Claim": pending["claim_secret"]})
         assert completed.status_code == 200
         payload = completed.json()
         if payload["status"] == "approved":
@@ -337,7 +337,7 @@ def test_channel_join_requires_existing_member_approval_after_first_member(tmp_p
 
     approved = client.post(f"/api/join-requests/{pending['request_id']}/approve", headers=_auth(alice["member_token"]))
     assert approved.status_code == 200
-    completed = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": pending["claim_secret"]})
+    completed = client.get(f"/api/join-requests/{pending['request_id']}", headers={"X-Orbit-Claim": pending["claim_secret"]})
     assert completed.status_code == 200
     payload = completed.json()
     assert payload["status"] == "approved"

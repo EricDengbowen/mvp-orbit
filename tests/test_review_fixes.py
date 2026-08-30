@@ -31,7 +31,7 @@ def _join(client: TestClient, alias: str, channel: str = "team", approver_token:
     if payload["status"] == "pending":
         assert approver_token is not None
         client.post(f"/api/join-requests/{payload['request_id']}/approve", headers=_auth(approver_token))
-        payload = client.get(f"/api/join-requests/{payload['request_id']}", params={"secret": payload["claim_secret"]}).json()
+        payload = client.get(f"/api/join-requests/{payload['request_id']}", headers={"X-Orbit-Claim": payload["claim_secret"]}).json()
     assert payload["status"] == "approved"
     return payload
 
@@ -49,7 +49,7 @@ def test_rejoin_of_existing_alias_requires_approval(tmp_path):
 
     # After approval by an existing member the returning alias keeps its role.
     client.post(f"/api/join-requests/{rejoin['request_id']}/approve", headers=_auth(alice["member_token"]))
-    approved = client.get(f"/api/join-requests/{rejoin['request_id']}", params={"secret": rejoin["claim_secret"]}).json()
+    approved = client.get(f"/api/join-requests/{rejoin['request_id']}", headers={"X-Orbit-Claim": rejoin["claim_secret"]}).json()
     assert approved["status"] == "approved"
     assert approved["member_token"]
     members = client.get("/api/members", headers=_auth(approved["member_token"])).json()
@@ -168,13 +168,13 @@ def test_approved_join_request_token_needs_claim_secret(tmp_path):
     assert scraped["member_token"] is None
 
     # The requester (who holds the secret) can poll and even retry safely.
-    first = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": pending["claim_secret"]}).json()
+    first = client.get(f"/api/join-requests/{pending['request_id']}", headers={"X-Orbit-Claim": pending["claim_secret"]}).json()
     assert first["member_token"]
-    retry = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": pending["claim_secret"]}).json()
+    retry = client.get(f"/api/join-requests/{pending['request_id']}", headers={"X-Orbit-Claim": pending["claim_secret"]}).json()
     assert retry["member_token"]  # a lost response is recoverable
     assert client.get("/api/peers", headers={"Authorization": f"Bearer {retry['member_token']}"}).status_code == 200
 
-    wrong = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": "nope"}).json()
+    wrong = client.get(f"/api/join-requests/{pending['request_id']}", headers={"X-Orbit-Claim": "nope"}).json()
     assert wrong["member_token"] is None
 
 
@@ -251,16 +251,26 @@ def test_join_reuses_valid_saved_credentials(tmp_path, monkeypatch, capsys):
         OrbitConfig(
             hub=HubConfig(url="http://hub.example"),
             auth=AuthConfig(member_token="tok", expires_at=utc_now() + _td(days=1)),
-            client=ClientConfig(id="me"),
+            client=ClientConfig(id="me", channel="team"),
         ),
         config_path,
     )
     monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
 
+    class _NetworkTouched(Exception):
+        pass
+
     def _no_network(*a, **k):
-        raise AssertionError("join must not hit the network when saved credentials are valid")
+        raise _NetworkTouched
 
     monkeypatch.setattr(cli_main, "_post_join_with_retry", _no_network)
     assert cli_main.main(["join", "--alias", "me", "--channel", "team", "--no-start"]) == 0
     out = capsys.readouterr().out
     assert "already-enrolled" in out
+
+    # A different channel must NOT silently reuse the old channel's token.
+    with pytest.raises(_NetworkTouched):
+        cli_main.main(["join", "--alias", "me", "--channel", "other", "--no-start"])
+    # And --force-rejoin always goes through the join flow.
+    with pytest.raises(_NetworkTouched):
+        cli_main.main(["join", "--alias", "me", "--channel", "team", "--no-start", "--force-rejoin"])

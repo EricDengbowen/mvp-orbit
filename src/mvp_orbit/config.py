@@ -36,6 +36,7 @@ class ClientConfig(BaseModel):
 
     id: str | None = None
     workspace_root: str | None = None
+    channel: str | None = None
 
 
 class OrbitConfig(BaseModel):

@@ -22,7 +22,7 @@ def _join(client: TestClient, alias: str, channel: str = "team", approver_token:
         assert approver_token is not None
         approved = client.post(f"/api/join-requests/{payload['request_id']}/approve", headers=_auth(approver_token))
         assert approved.status_code == 200
-        payload = client.get(f"/api/join-requests/{payload['request_id']}", params={"secret": payload["claim_secret"]}).json()
+        payload = client.get(f"/api/join-requests/{payload['request_id']}", headers={"X-Orbit-Claim": payload["claim_secret"]}).json()
     assert payload["status"] == "approved"
     return payload
 

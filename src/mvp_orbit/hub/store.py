@@ -356,24 +356,8 @@ class HubStore:
                 # nothing. Requests created before claim secrets existed fall
                 # back to strict single-use minting.
                 stored_secret = row["claim_secret"]
-                if stored_secret is not None:
-                    if claim_secret is not None and secrets.compare_digest(str(stored_secret), claim_secret):
-                        token = self._issue_token_locked(record.channel_id, alias=record.alias)
-                        return JoinResponse(
-                            status=record.status,
-                            alias=record.alias,
-                            channel_id=record.channel_id,
-                            request_id=record.request_id,
-                            member_token=token.member_token,
-                            expires_at=token.expires_at,
-                        )
-                    log_kv(logger, logging.WARNING, "join.token_claim_denied", request_id=request_id, alias=record.alias)
-                elif row["token_issued_at"] is None:
+                if stored_secret is not None and claim_secret is not None and secrets.compare_digest(str(stored_secret), claim_secret):
                     token = self._issue_token_locked(record.channel_id, alias=record.alias)
-                    self._conn.execute(
-                        "UPDATE join_requests SET token_issued_at = ? WHERE request_id = ?",
-                        (utc_now().isoformat(), request_id),
-                    )
                     return JoinResponse(
                         status=record.status,
                         alias=record.alias,
@@ -382,8 +366,10 @@ class HubStore:
                         member_token=token.member_token,
                         expires_at=token.expires_at,
                     )
-                else:
-                    log_kv(logger, logging.WARNING, "join.token_replay_blocked", request_id=request_id, alias=record.alias)
+                # No anonymous fallback, even for requests created before claim
+                # secrets existed: those requesters simply run `orbit join`
+                # again. A request id alone must never mint a credential.
+                log_kv(logger, logging.WARNING, "join.token_claim_denied", request_id=request_id, alias=record.alias)
             return JoinResponse(status=record.status, alias=record.alias, channel_id=record.channel_id, request_id=record.request_id)
 
     def list_join_requests(self, channel_id: str, status_filter: JoinRequestStatus | None = None) -> list[JoinApprovalRecord]:

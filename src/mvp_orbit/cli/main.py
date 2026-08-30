@@ -361,7 +361,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         and config.auth.expires_at is not None
         and config.auth.expires_at > utc_now()
         and config.client.id == alias
-        and (args.host is None or config.hub.url == args.host)
+        and (args.host is None or args.host in (config.hub.url, config.hub.resolved_url()))
+        and (channel is None or (config.client.channel is not None and config.client.channel == channel))
     ):
         print(
             json.dumps(
@@ -397,7 +398,13 @@ def cmd_join(args: argparse.Namespace) -> int:
     if payload["status"] == JoinRequestStatus.PENDING.value:
         request_id = payload["request_id"]
         claim_secret = payload.get("claim_secret")
-        print(json.dumps({"status": "pending", "request_id": request_id, "alias": alias, "channel_id": payload["channel_id"], "claim_secret": claim_secret}, ensure_ascii=False, indent=2))
+        summary = {"status": "pending", "request_id": request_id, "alias": alias, "channel_id": payload["channel_id"]}
+        if args.no_wait and claim_secret:
+            # Only --no-wait needs the secret surfaced (to collect the token
+            # later); the waiting flow keeps it in memory. Keep it out of logs.
+            summary["claim_secret"] = claim_secret
+            summary["note"] = "keep claim_secret private — whoever holds it collects the member token after approval"
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         if args.no_wait:
             return 0
         deadline = time.monotonic() + args.wait_sec
@@ -405,11 +412,12 @@ def cmd_join(args: argparse.Namespace) -> int:
             time.sleep(2.0)
             try:
                 with httpx.Client(timeout=20) as client:
-                    response = client.get(
-                        f"{host}/api/join-requests/{request_id}",
-                        headers=_headers(None),
-                        params={"secret": claim_secret} if claim_secret else None,
-                    )
+                    headers = _headers(None)
+                    if claim_secret:
+                        # Header, not query string: keeps the secret out of
+                        # proxy and access logs.
+                        headers["X-Orbit-Claim"] = claim_secret
+                    response = client.get(f"{host}/api/join-requests/{request_id}", headers=headers)
                     response.raise_for_status()
                     payload = response.json()
             except httpx.RequestError as exc:
@@ -433,6 +441,7 @@ def cmd_join(args: argparse.Namespace) -> int:
 
     config.hub.url = host
     config.client.id = alias
+    config.client.channel = channel
     config.auth.member_token = payload["member_token"]
     config.auth.expires_at = _parse_datetime(payload["expires_at"])
     if not config.client.workspace_root:
