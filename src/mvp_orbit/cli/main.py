@@ -365,7 +365,8 @@ def cmd_join(args: argparse.Namespace) -> int:
 
     if payload["status"] == JoinRequestStatus.PENDING.value:
         request_id = payload["request_id"]
-        print(json.dumps({"status": "pending", "request_id": request_id, "alias": alias, "channel_id": payload["channel_id"]}, ensure_ascii=False, indent=2))
+        claim_secret = payload.get("claim_secret")
+        print(json.dumps({"status": "pending", "request_id": request_id, "alias": alias, "channel_id": payload["channel_id"], "claim_secret": claim_secret}, ensure_ascii=False, indent=2))
         if args.no_wait:
             return 0
         deadline = time.monotonic() + args.wait_sec
@@ -373,7 +374,11 @@ def cmd_join(args: argparse.Namespace) -> int:
             time.sleep(2.0)
             try:
                 with httpx.Client(timeout=20) as client:
-                    response = client.get(f"{host}/api/join-requests/{request_id}", headers=_headers(None))
+                    response = client.get(
+                        f"{host}/api/join-requests/{request_id}",
+                        headers=_headers(None),
+                        params={"secret": claim_secret} if claim_secret else None,
+                    )
                     response.raise_for_status()
                     payload = response.json()
             except httpx.RequestError as exc:

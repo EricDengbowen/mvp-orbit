@@ -83,6 +83,9 @@ class JoinResponse(BaseModel):
     request_id: str | None = None
     member_token: str | None = None
     expires_at: datetime | None = None
+    # Returned once, on request creation, to the (anonymous) requester: the
+    # only party allowed to collect the member token after approval.
+    claim_secret: str | None = None
 
 
 class JoinApprovalRecord(BaseModel):

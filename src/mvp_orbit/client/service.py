@@ -112,6 +112,7 @@ class ClientService:
         self._join_prompt_lock = threading.Lock()
         self._join_prompts_active: set[str] = set()
         self._stream_unusable = threading.Event()
+        self._shutdown = threading.Event()
 
     def stream_healthy(self) -> bool:
         # Connected AND recently active. The hub keepalives at least every 5s,
@@ -197,6 +198,10 @@ class ClientService:
                         ) from exc
                     time.sleep(min(60.0, 2.0 ** min(consecutive_failures - 1, 6)))
         finally:
+            # Tell lingering worker threads (e.g. terminal-event retry loops)
+            # to stop before their shared client goes away; the hub's
+            # reconcile-on-reconnect resolves whatever they could not deliver.
+            self._shutdown.set()
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=2.0)
             if own_client:
@@ -251,6 +256,7 @@ class ClientService:
             self._last_stream_error = None
             self._write_status_file()
             log_kv(logger, logging.INFO, "client.stream_connected", client_id=self.client_id)
+            self._send_reconcile(client)
             connected_monotonic = time.monotonic()
             block: list[str] = []
             for line in response.iter_lines():
@@ -525,7 +531,7 @@ class ClientService:
         # client does not linger on this loop.
         attempt = 0
         delay = 1.0
-        while True:
+        while not self._shutdown.is_set():
             attempt += 1
             try:
                 self._post_client_events(client, [event])
@@ -533,8 +539,10 @@ class ClientService:
             except Exception as exc:
                 level = logging.WARNING if attempt % 5 == 1 else logging.DEBUG
                 log_kv(logger, level, f"{what}.exit_post_failed", client_id=self.client_id, key=key, error=exc.__class__.__name__, attempt=attempt)
-                time.sleep(delay)
+                if self._shutdown.wait(delay):
+                    break
                 delay = min(30.0, delay * 2)
+        log_kv(logger, logging.WARNING, f"{what}.exit_post_abandoned", client_id=self.client_id, key=key, reason="client shutting down; hub reconcile will resolve the record")
 
     def _post_client_events(self, client: httpx.Client, events: list[ClientEvent]) -> None:
         if not events:
@@ -545,6 +553,20 @@ class ClientService:
             json=ClientEventsRequest(events=events).model_dump(mode="json"),
         )
         self._raise_for_status(response)
+
+    def _send_reconcile(self, client: httpx.Client) -> None:
+        # On every (re)connect, tell the hub which work this client is really
+        # executing. The hub fails any RUNNING record of ours that is not in
+        # the list — that is what resolves work whose exit report was lost
+        # across a restart. Best-effort: an old hub rejects the event kind.
+        payload = {
+            "active_command_ids": sorted(self._command_cancels.keys()),
+            "active_session_ids": sorted(self._shell_controls.keys()),
+        }
+        try:
+            self._post_client_events(client, [ClientEvent(kind="client.reconcile", payload=payload)])
+        except Exception as exc:
+            log_kv(logger, logging.WARNING, "client.reconcile_failed", client_id=self.client_id, error=exc.__class__.__name__, detail=exc)
 
     def _write_status_file(self) -> None:
         # Local self-diagnosis (read by `orbit status`): answers "is my own

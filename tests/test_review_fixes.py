@@ -31,7 +31,7 @@ def _join(client: TestClient, alias: str, channel: str = "team", approver_token:
     if payload["status"] == "pending":
         assert approver_token is not None
         client.post(f"/api/join-requests/{payload['request_id']}/approve", headers=_auth(approver_token))
-        payload = client.get(f"/api/join-requests/{payload['request_id']}").json()
+        payload = client.get(f"/api/join-requests/{payload['request_id']}", params={"secret": payload["claim_secret"]}).json()
     assert payload["status"] == "approved"
     return payload
 
@@ -49,7 +49,7 @@ def test_rejoin_of_existing_alias_requires_approval(tmp_path):
 
     # After approval by an existing member the returning alias keeps its role.
     client.post(f"/api/join-requests/{rejoin['request_id']}/approve", headers=_auth(alice["member_token"]))
-    approved = client.get(f"/api/join-requests/{rejoin['request_id']}").json()
+    approved = client.get(f"/api/join-requests/{rejoin['request_id']}", params={"secret": rejoin["claim_secret"]}).json()
     assert approved["status"] == "approved"
     assert approved["member_token"]
     members = client.get("/api/members", headers=_auth(approved["member_token"])).json()
@@ -156,16 +156,85 @@ def test_sole_member_channel_can_reenroll_itself(tmp_path):
     assert other["status"] == "pending"
 
 
-def test_approved_join_request_token_is_single_use(tmp_path):
+def test_approved_join_request_token_needs_claim_secret(tmp_path):
     client, _ = _build_client(tmp_path)
     alice = _join(client, "alice")
     pending = client.post("/api/join", json={"alias": "bob", "channel": "team"}).json()
     client.post(f"/api/join-requests/{pending['request_id']}/approve", headers=_auth(alice["member_token"]))
 
-    first = client.get(f"/api/join-requests/{pending['request_id']}").json()
-    assert first["status"] == "approved"
-    assert first["member_token"]
+    # Without the claim secret (e.g. a request id scraped from logs): no token.
+    scraped = client.get(f"/api/join-requests/{pending['request_id']}").json()
+    assert scraped["status"] == "approved"
+    assert scraped["member_token"] is None
 
-    replay = client.get(f"/api/join-requests/{pending['request_id']}").json()
-    assert replay["status"] == "approved"
-    assert replay["member_token"] is None  # the request id is not a reusable credential
+    # The requester (who holds the secret) can poll and even retry safely.
+    first = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": pending["claim_secret"]}).json()
+    assert first["member_token"]
+    retry = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": pending["claim_secret"]}).json()
+    assert retry["member_token"]  # a lost response is recoverable
+    assert client.get("/api/peers", headers={"Authorization": f"Bearer {retry['member_token']}"}).status_code == 200
+
+    wrong = client.get(f"/api/join-requests/{pending['request_id']}", params={"secret": "nope"}).json()
+    assert wrong["member_token"] is None
+
+
+def test_reconnect_reconcile_fails_stale_running_work(tmp_path):
+    from mvp_orbit.core.models import ClientEvent
+
+    client, store = _build_client(tmp_path)
+    alice = _join(client, "alice")
+    store.register_client("worker", alice["channel_id"])
+
+    created = client.post(
+        "/api/commands",
+        json={"client_id": "worker", "argv": ["sleep", "999"], "working_dir": ".", "timeout_sec": 3600, "env_patch": {}},
+        headers=_auth(alice["member_token"]),
+    )
+    stale_id = created.json()["command_id"]
+    client.post(f"/api/commands/{stale_id}/claim", headers=_auth(alice["member_token"]))
+
+    live = client.post(
+        "/api/commands",
+        json={"client_id": "worker", "argv": ["sleep", "999"], "working_dir": ".", "timeout_sec": 3600, "env_patch": {}},
+        headers=_auth(alice["member_token"]),
+    )
+    live_id = live.json()["command_id"]
+    client.post(f"/api/commands/{live_id}/claim", headers=_auth(alice["member_token"]))
+
+    # The restarted client reconciles: it only knows about the live command.
+    store.apply_client_events("worker", [ClientEvent(kind="client.reconcile", payload={"active_command_ids": [live_id]})])
+
+    stale = client.get(f"/api/commands/{stale_id}", headers=_auth(alice["member_token"])).json()
+    assert stale["status"] == "failed"
+    assert stale["failure_code"] == "client_restarted"
+    events = store.get_command_events(stale_id, 0)
+    assert events[-1].kind == "command.exit"
+
+    still_live = client.get(f"/api/commands/{live_id}", headers=_auth(alice["member_token"])).json()
+    assert still_live["status"] == "running"  # genuinely running work is untouched
+
+
+def test_terminal_retry_stops_on_shutdown(tmp_path):
+    from mvp_orbit.core.models import ClientEvent
+    import threading
+
+    service = ClientService(
+        client_id="client-a",
+        hub_url="http://127.0.0.1:1",  # unreachable
+        runtime=ClientRuntime(client_id="client-a", base_workspace=tmp_path / "ws"),
+        member_token="tok",
+    )
+    import httpx as _httpx
+
+    done = threading.Event()
+
+    def worker():
+        with _httpx.Client(timeout=1.0) as c:
+            service._post_terminal_event(c, ClientEvent(kind="command.exit", payload={"command_id": "x", "status": "failed"}), what="command", key="x")
+        done.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    time.sleep(1.5)  # let it fail at least once and enter its wait
+    service._shutdown.set()
+    assert done.wait(timeout=10.0)  # the retry loop must exit promptly on shutdown

@@ -253,6 +253,7 @@ class HubStore:
             "ALTER TABLE channel_members ADD COLUMN role TEXT NOT NULL DEFAULT 'member'",
             "ALTER TABLE member_tokens ADD COLUMN alias TEXT",
             "ALTER TABLE join_requests ADD COLUMN token_issued_at TEXT",
+            "ALTER TABLE join_requests ADD COLUMN claim_secret TEXT",
         ):
             try:
                 self._conn.execute(statement)
@@ -326,32 +327,48 @@ class HubStore:
                     )
 
             now = utc_now()
+            claim_secret = secrets.token_urlsafe(16)
             self._conn.execute(
                 """
                 INSERT INTO join_requests (
                     request_id, channel_id, alias, status, requested_at,
-                    approved_at, approved_by, rejected_at, rejected_by
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
+                    approved_at, approved_by, rejected_at, rejected_by, claim_secret
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
                 """,
-                (request_id, channel_id, alias, JoinRequestStatus.PENDING.value, now.isoformat()),
+                (request_id, channel_id, alias, JoinRequestStatus.PENDING.value, now.isoformat(), claim_secret),
             )
             self._append_join_request_events_locked(channel_id, request_id, alias, now)
             log_kv(logger, logging.INFO, "join.pending", channel_id=channel_id, alias=alias, request_id=request_id)
         self._notify_update()
-        return JoinResponse(status=JoinRequestStatus.PENDING, alias=alias, channel_id=channel_id, request_id=request_id)
+        return JoinResponse(status=JoinRequestStatus.PENDING, alias=alias, channel_id=channel_id, request_id=request_id, claim_secret=claim_secret)
 
-    def get_join_request_response(self, request_id: str) -> JoinResponse | None:
+    def get_join_request_response(self, request_id: str, *, claim_secret: str | None = None) -> JoinResponse | None:
         with self._lock, self._conn:
             row = self._conn.execute("SELECT * FROM join_requests WHERE request_id = ?", (request_id,)).fetchone()
             if row is None:
                 return None
             record = self._row_to_join_approval(dict(row))
             if record.status == JoinRequestStatus.APPROVED:
-                # This endpoint is anonymous, so an approved request id must be
-                # a single-use credential: mint the token exactly once. Anyone
-                # replaying the id later (e.g. from a logged URL) gets the
-                # status but no token.
-                if row["token_issued_at"] is None:
+                # This endpoint is anonymous, so the member token is released
+                # only to whoever holds the claim_secret issued with the
+                # request. Retries are then safe (a lost response can simply be
+                # re-polled) while a request id scraped from logs mints
+                # nothing. Requests created before claim secrets existed fall
+                # back to strict single-use minting.
+                stored_secret = row["claim_secret"]
+                if stored_secret is not None:
+                    if claim_secret is not None and secrets.compare_digest(str(stored_secret), claim_secret):
+                        token = self._issue_token_locked(record.channel_id, alias=record.alias)
+                        return JoinResponse(
+                            status=record.status,
+                            alias=record.alias,
+                            channel_id=record.channel_id,
+                            request_id=record.request_id,
+                            member_token=token.member_token,
+                            expires_at=token.expires_at,
+                        )
+                    log_kv(logger, logging.WARNING, "join.token_claim_denied", request_id=request_id, alias=record.alias)
+                elif row["token_issued_at"] is None:
                     token = self._issue_token_locked(record.channel_id, alias=record.alias)
                     self._conn.execute(
                         "UPDATE join_requests SET token_issued_at = ? WHERE request_id = ?",
@@ -365,7 +382,8 @@ class HubStore:
                         member_token=token.member_token,
                         expires_at=token.expires_at,
                     )
-                log_kv(logger, logging.WARNING, "join.token_replay_blocked", request_id=request_id, alias=record.alias)
+                else:
+                    log_kv(logger, logging.WARNING, "join.token_replay_blocked", request_id=request_id, alias=record.alias)
             return JoinResponse(status=record.status, alias=record.alias, channel_id=record.channel_id, request_id=record.request_id)
 
     def list_join_requests(self, channel_id: str, status_filter: JoinRequestStatus | None = None) -> list[JoinApprovalRecord]:
@@ -763,6 +781,45 @@ class HubStore:
             for item in events:
                 kind = item.kind
                 payload = dict(item.payload)
+                if kind == "client.reconcile":
+                    active_commands = set(payload.get("active_command_ids") or [])
+                    active_shells = set(payload.get("active_session_ids") or [])
+                    now = utc_now().isoformat()
+                    for row in self._conn.execute(
+                        "SELECT command_id FROM commands WHERE client_id = ? AND status = ?",
+                        (client_id, CommandStatus.RUNNING.value),
+                    ).fetchall():
+                        command_id = str(row["command_id"])
+                        if command_id in active_commands:
+                            continue
+                        self._conn.execute(
+                            "UPDATE commands SET status = ?, finished_at = ?, failure_code = ? WHERE command_id = ? AND status = ?",
+                            (CommandStatus.FAILED.value, now, "client_restarted", command_id, CommandStatus.RUNNING.value),
+                        )
+                        self._append_command_event_locked(
+                            command_id,
+                            "command.exit",
+                            {"command_id": command_id, "status": CommandStatus.FAILED.value, "exit_code": None, "failure_code": "client_restarted"},
+                        )
+                        log_kv(logger, logging.WARNING, "command.client_restarted", command_id=command_id, client_id=client_id)
+                    for row in self._conn.execute(
+                        "SELECT session_id FROM shell_sessions WHERE client_id = ? AND status = ?",
+                        (client_id, ShellSessionStatus.RUNNING.value),
+                    ).fetchall():
+                        session_id = str(row["session_id"])
+                        if session_id in active_shells:
+                            continue
+                        self._conn.execute(
+                            "UPDATE shell_sessions SET status = ?, finished_at = ?, failure_code = ? WHERE session_id = ? AND status = ?",
+                            (ShellSessionStatus.FAILED.value, now, "client_restarted", session_id, ShellSessionStatus.RUNNING.value),
+                        )
+                        self._append_shell_event_locked(
+                            session_id,
+                            "shell.exit",
+                            {"session_id": session_id, "status": ShellSessionStatus.FAILED.value, "exit_code": None, "failure_code": "client_restarted"},
+                        )
+                        log_kv(logger, logging.WARNING, "shell.client_restarted", session_id=session_id, client_id=client_id)
+                    continue
                 if kind == "client.heartbeat":
                     now = utc_now().isoformat()
                     stream_connected = payload.get("stream_connected")

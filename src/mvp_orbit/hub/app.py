@@ -228,8 +228,8 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
         return store.request_channel_join(request_id=default_join_request_id(), alias=request.alias, channel=request.channel)
 
     @app.get("/api/join-requests/{request_id}", response_model=JoinResponse)
-    def get_join_request(request_id: str) -> JoinResponse:
-        response = store.get_join_request_response(request_id)
+    def get_join_request(request_id: str, secret: str | None = Query(default=None)) -> JoinResponse:
+        response = store.get_join_request_response(request_id, claim_secret=secret)
         if response is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="join request not found")
         return response
