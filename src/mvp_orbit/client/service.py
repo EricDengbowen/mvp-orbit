@@ -207,6 +207,12 @@ class ClientService:
         timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
         consecutive_failures = 0
         with httpx.Client(timeout=timeout) as client:
+            # Give the stream a moment to establish so the very first heartbeat
+            # reports real health instead of a startup race.
+            for _ in range(10):
+                if self._stream_connected or stop.is_set():
+                    break
+                stop.wait(0.5)
             while not stop.is_set():
                 # The heartbeat reports the event stream's health instead of
                 # pretending everything is fine: last_seen_at then means "the

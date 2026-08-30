@@ -1295,6 +1295,12 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"[orbit] error: {exc}", file=sys.stderr)
         return 1
+    except httpx.RequestError as exc:
+        print(
+            f"[orbit] error: cannot reach the hub ({exc.__class__.__name__}: {exc}) — is it running, and is this machine's network/proxy environment sane?",
+            file=sys.stderr,
+        )
+        return 1
     except KeyboardInterrupt:
         return 130
     return int(result or 0)
