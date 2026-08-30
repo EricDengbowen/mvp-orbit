@@ -37,6 +37,7 @@ from mvp_orbit.core.models import (
     ShellSessionLease,
     ShellSessionRecord,
     ShellSessionStatus,
+    TokenResponse,
     default_command_id,
     default_file_transfer_id,
     default_join_request_id,
@@ -277,6 +278,14 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
     @app.get("/api/members")
     def list_members(member: AuthenticatedMember = Depends(require_member)) -> list[dict]:
         return store.list_members(member.channel_id)
+
+    @app.post("/api/members/renew", response_model=TokenResponse)
+    def renew_member_token(member: AuthenticatedMember = Depends(require_member)) -> TokenResponse:
+        alias = _require_alias(member)
+        try:
+            return store.renew_member_token(member.channel_id, alias)
+        except MembershipError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
     @app.post("/api/members/leave")
     def leave_channel(member: AuthenticatedMember = Depends(require_member)) -> dict:

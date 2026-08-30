@@ -134,3 +134,70 @@ def test_migration_backfills_first_member_as_admin(tmp_path):
     with reopened._lock:
         rows = reopened._conn.execute("SELECT alias, role FROM channel_members ORDER BY created_at ASC").fetchall()
     assert [(r["alias"], r["role"]) for r in rows] == [("alice", "admin"), ("bob", "member")]
+
+
+def test_valid_token_can_renew_without_approval(tmp_path):
+    client, _ = _build_client(tmp_path)
+    alice = _join(client, "alice")
+
+    renewed = client.post("/api/members/renew", headers=_auth(alice["member_token"]))
+    assert renewed.status_code == 200
+    payload = renewed.json()
+    assert payload["alias"] == "alice"
+    assert payload["member_token"] != alice["member_token"]
+    # Both tokens work: the old one ages out naturally (a lost renewal
+    # response must not brick the client).
+    assert client.get("/api/peers", headers=_auth(payload["member_token"])).status_code == 200
+    assert client.get("/api/peers", headers=_auth(alice["member_token"])).status_code == 200
+
+
+def test_legacy_token_cannot_renew(tmp_path):
+    client, store = _build_client(tmp_path)
+    alice = _join(client, "alice")
+    with store._lock, store._conn:
+        store._conn.execute("UPDATE member_tokens SET alias = NULL")
+    response = client.post("/api/members/renew", headers=_auth(alice["member_token"]))
+    assert response.status_code == 403
+    assert "re-enroll" in response.json()["detail"]
+
+
+def test_renew_helper_is_noop_when_token_is_fresh(tmp_path, monkeypatch):
+    from datetime import timedelta as _td
+
+    from mvp_orbit.cli import main as cli_main
+    from mvp_orbit.config import AuthConfig, ClientConfig, HubConfig, OrbitConfig, save_config
+    from mvp_orbit.core.models import utc_now
+
+    config_path = tmp_path / "config.toml"
+    save_config(
+        OrbitConfig(
+            hub=HubConfig(url="http://hub.example"),
+            auth=AuthConfig(member_token="tok", expires_at=utc_now() + _td(days=6)),
+            client=ClientConfig(id="me", channel="team"),
+        ),
+        config_path,
+    )
+
+    def _no_network(*a, **k):
+        raise AssertionError("fresh token must not trigger a renewal request")
+
+    monkeypatch.setattr(cli_main.httpx, "Client", _no_network)
+    assert cli_main._renew_if_needed(str(config_path)) is False
+
+
+def test_client_swaps_to_renewed_credentials(tmp_path, monkeypatch):
+    from datetime import timedelta as _td
+
+    from mvp_orbit.client.main import _load_renewed_credentials
+    from mvp_orbit.config import AuthConfig, ClientConfig, HubConfig, OrbitConfig, save_config
+    from mvp_orbit.core.models import utc_now
+
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+
+    save_config(OrbitConfig(auth=AuthConfig(member_token="fresh", expires_at=utc_now() + _td(days=6))), config_path)
+    assert _load_renewed_credentials("old")[0] == "fresh"
+    assert _load_renewed_credentials("fresh") is None  # same token: nothing to swap to
+
+    save_config(OrbitConfig(auth=AuthConfig(member_token="stale", expires_at=utc_now() - _td(seconds=1))), config_path)
+    assert _load_renewed_credentials("old") is None  # expired on disk: no help

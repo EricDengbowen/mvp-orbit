@@ -338,9 +338,79 @@ def _post_join_with_retry(host: str, request: JoinRequest, *, budget_sec: float 
         delay = min(8.0, delay * 2)
 
 
-def _run_client_loop(config: OrbitConfig) -> int:
+# Renew when less than 3 of the 7 token-TTL days remain; checked at every
+# start and every 6h while a client loop runs.
+RENEW_THRESHOLD_SEC = 3 * 86400
+_renewal_thread_started = False
+
+
+def _renew_if_needed(config_path: str, *, force: bool = False) -> bool:
+    """Swap a still-valid member token for a fresh 7-day one.
+
+    A valid token is itself the proof of identity, so this needs no approval.
+    An already-expired token cannot be renewed — that machine re-joins and a
+    teammate approves it."""
+    config_path, config = load_config(config_path)
+    if not config.auth.member_token or config.auth.expires_at is None:
+        if force:
+            raise RuntimeError("no saved credentials — run `orbit join` first")
+        return False
+    remaining = (config.auth.expires_at - utc_now()).total_seconds()
+    if remaining <= 0:
+        if force:
+            raise RuntimeError("token already expired — renewal needs a valid token; run `orbit join` and have a member approve")
+        return False
+    if not force and remaining > RENEW_THRESHOLD_SEC:
+        return False
+    old_token = config.auth.member_token
+    with httpx.Client(timeout=20) as client:
+        response = client.post(f"{config.hub.resolved_url()}/api/members/renew", headers=_headers(old_token))
+        _raise_with_guidance(response)
+        payload = response.json()
+    # Compare-and-swap: if the saved credentials changed while we were talking
+    # to the hub (a concurrent leave/rejoin), discard this renewal instead of
+    # resurrecting an outdated identity.
+    _, current = load_config(config_path)
+    if current.auth.member_token != old_token:
+        print("[orbit] credentials changed during renewal; discarding the renewed token", file=sys.stderr, flush=True)
+        return False
+    current.auth.member_token = payload["member_token"]
+    current.auth.expires_at = _parse_datetime(payload["expires_at"])
+    save_config(current, config_path)
+    print(f"[orbit] member token renewed, now valid until {payload['expires_at']}", file=sys.stderr, flush=True)
+    return True
+
+
+def _start_renewal_thread(config_path: str) -> None:
+    global _renewal_thread_started
+    if _renewal_thread_started:
+        return
+    _renewal_thread_started = True
+
+    def loop() -> None:
+        while True:
+            try:
+                _renew_if_needed(config_path)
+            except Exception as exc:  # noqa: BLE001 — renewal must never kill the client
+                print(f"[orbit] token renewal attempt failed ({exc.__class__.__name__}: {exc}); will retry", file=sys.stderr, flush=True)
+            time.sleep(6 * 3600)
+
+    threading.Thread(target=loop, daemon=True, name="orbit-token-renewal").start()
+
+
+def cmd_renew(args: argparse.Namespace) -> int:
+    config_path, config = load_config(args.config)
+    _renew_if_needed(str(config_path), force=True)
+    _, config = load_config(config_path)
+    print(json.dumps({"status": "renewed", "alias": config.client.id, "token_expires_at": config.auth.expires_at.isoformat() if config.auth.expires_at else None}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _run_client_loop(config: OrbitConfig, config_path: str | None = None) -> int:
     from mvp_orbit.client.main import main as client_main
 
+    if config_path is not None:
+        _start_renewal_thread(config_path)
     _apply_runtime_env(config)
     client_main()
     return 0
@@ -364,6 +434,11 @@ def cmd_join(args: argparse.Namespace) -> int:
         and (args.host is None or args.host in (config.hub.url, config.hub.resolved_url()))
         and (channel is None or (config.client.channel is not None and config.client.channel == channel))
     ):
+        try:
+            if _renew_if_needed(str(config_path)):
+                _, config = load_config(config_path)
+        except Exception as exc:  # noqa: BLE001 — the saved token is still valid; renewal can retry later
+            print(f"[orbit] token renewal attempt failed ({exc.__class__.__name__}: {exc}); continuing with the current token", file=sys.stderr)
         print(
             json.dumps(
                 {
@@ -382,7 +457,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             return 0
         if getattr(args, "daemon", False):
             return _daemonize_and_supervise(config_path)
-        return _run_client_loop(config)
+        return _run_client_loop(config, str(config_path))
     if not (args.host and args.alias and channel):
         wizard = SetupWizard(
             "ORBIT JOIN",
@@ -469,7 +544,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         return 0
     if getattr(args, "daemon", False):
         return _daemonize_and_supervise(config_path)
-    return _run_client_loop(config)
+    return _run_client_loop(config, str(saved_path))
 
 
 def cmd_join_requests(args: argparse.Namespace) -> int:
@@ -1064,14 +1139,19 @@ def cmd_daemon_supervise(args: argparse.Namespace) -> int:
     delay = 10.0
     try:
         while True:
-            _, config = load_config(config_path)
+            try:
+                _, config = load_config(config_path)
+            except Exception as exc:  # noqa: BLE001 — e.g. a torn read; retry
+                print(f"[orbit-daemon] cannot read config ({exc.__class__.__name__}: {exc}), retrying in 10s", flush=True)
+                time.sleep(10)
+                continue
             if config.auth.expires_at is None or config.auth.expires_at <= utc_now():
                 print("[orbit-daemon] member token expired — run `orbit join` again, then restart the daemon", flush=True)
                 break
             _force_runtime_env(config)
             started = time.monotonic()
             try:
-                _run_client_loop(config)
+                _run_client_loop(config, str(config_path))
                 code: int | str | None = 0
             except SystemExit as exc:
                 code = exc.code
@@ -1188,7 +1268,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor,members,leave,remove,transfer-admin}",
+        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor,members,leave,remove,transfer-admin,renew}",
     )
 
     host = sub.add_parser("host", help="start the control host")
@@ -1204,6 +1284,9 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--daemon", action="store_true", help="run the client loop as a supervised background daemon (auto-restart, log under ~/.local/state/mvp-orbit)")
     join.add_argument("--force-rejoin", action="store_true", help="request fresh credentials even when valid saved ones exist (needs member approval)")
     join.set_defaults(func=cmd_join)
+
+    renew = sub.add_parser("renew", help="swap the saved member token for a fresh 7-day one (needs the current token to still be valid)")
+    renew.set_defaults(func=cmd_renew)
 
     status = sub.add_parser("status", help="show this machine's client state (local, no token needed)")
     status.add_argument("--client-id", default=None)

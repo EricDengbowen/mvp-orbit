@@ -66,11 +66,16 @@ def load_config(path: str | Path | None = None) -> tuple[Path, OrbitConfig]:
 def save_config(config: OrbitConfig, path: str | Path | None = None) -> Path:
     resolved = resolve_config_path(path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    resolved.write_text(render_config(config), encoding="utf-8")
+    # Atomic replace: the token-renewal thread, the daemon supervisor and CLI
+    # commands may touch this file concurrently — a reader must never observe
+    # a half-written credentials file.
+    tmp = resolved.with_suffix(resolved.suffix + ".tmp")
+    tmp.write_text(render_config(config), encoding="utf-8")
     try:
-        os.chmod(resolved, 0o600)
+        os.chmod(tmp, 0o600)
     except OSError:
         pass
+    os.replace(tmp, resolved)
     return resolved
 
 

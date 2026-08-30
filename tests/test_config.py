@@ -58,7 +58,7 @@ def test_top_level_help_contains_only_new_commands(capsys):
     except SystemExit as exc:
         assert exc.code == 0
     output = capsys.readouterr().out
-    assert "{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor,members,leave,remove,transfer-admin}" in output
+    assert "{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor,members,leave,remove,transfer-admin,renew}" in output
     assert "cmd" not in output
     assert "package" not in output
     assert "connect" not in output
@@ -82,7 +82,7 @@ def test_join_writes_config_and_starts_client_loop(monkeypatch, tmp_path, capsys
 
     started = []
     monkeypatch.setattr("mvp_orbit.cli.main.httpx.Client", lambda timeout=20: _ClientWrapper(client))
-    monkeypatch.setattr("mvp_orbit.cli.main._run_client_loop", lambda config: started.append(config.client.id) or 0)
+    monkeypatch.setattr("mvp_orbit.cli.main._run_client_loop", lambda config, config_path=None: started.append(config.client.id) or 0)
 
     assert main(["join", "--host", "http://127.0.0.1:10551", "--alias", "client-a", "--channel", "team-a"]) == 0
 

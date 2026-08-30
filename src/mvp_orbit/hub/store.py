@@ -988,6 +988,21 @@ class HubStore:
             return None
         return self._row_to_file_transfer(dict(row))
 
+    def renew_member_token(self, channel_id: str, alias: str) -> TokenResponse:
+        """Mint a fresh token for a member who presented a still-valid one.
+
+        Holding an unexpired token IS the proof of identity, so this needs no
+        approval — it is what keeps long-lived machines from hitting the 7-day
+        expiry (which, with approval-required re-enrollment, could deadlock a
+        channel if every member expired at once). The old token is not revoked;
+        it simply ages out, so a lost renewal response is harmless."""
+        with self._lock, self._conn:
+            if self._member_role_locked(channel_id, alias) is None:
+                raise MembershipError(f"{alias!r} is no longer a member of this channel")
+            token = self._issue_token_locked(channel_id, alias=alias)
+            log_kv(logger, logging.INFO, "member.token_renewed", channel_id=channel_id, alias=alias)
+        return token
+
     def list_members(self, channel_id: str) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(

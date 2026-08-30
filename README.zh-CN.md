@@ -179,6 +179,7 @@ orbit members                  # 列出成员、角色和在线状态
 orbit leave                    # 退出 channel 并吊销本机凭据
 orbit remove <alias>           # 管理员：移除成员并立即吊销其凭据
 orbit transfer-admin <alias>   # 管理员：移交管理员角色
+orbit renew                    # 用仍有效的 token 换一张新的 7 天 token
 ```
 
 常用 `join` 选项：
@@ -209,7 +210,7 @@ Channel 成员关系就是信任边界。
 
 - 第一个 client 创建 channel、获得 member token，并成为 **管理员**。
 - 后续 client 必须被已有成员审批后才能加入。同一 alias 的重新入会（比如 token 过期后重取凭据）同样需要审批——`/api/join` 是匿名接口，若凭 alias 就直接发 token，任何知道 channel 名和成员 alias 的人都能凭空铸造该成员（甚至管理员）的凭据。唯一例外是单成员 channel 给自己重取凭据——因为不存在能审批的其他人。审批通过后，member token 只发放给持有申请时下发的 claim secret 的一方（经 `X-Orbit-Claim` 请求头提交），单凭 request id 铸造不出任何凭据。
-- member token 在过期或被吊销前可访问该 channel。
+- member token 在过期（7 天）或被吊销前可访问该 channel。**仍在有效期内的 token 可随时免审批换新**（`orbit renew`——持有有效 token 本身就是身份证明），运行中的客户端在剩余不足 3 天时会自动续期，所以持续运行的机器实际上永不过期；只有**已经**过期的 token 才需要重新入会并由成员审批。
 - 任意已批准成员都可以对任意在线成员执行命令。
 - 只有管理员可以 `remove` 成员或调整角色；任何人都可以 `leave`。移除成员（或主动退出）会立即吊销该 alias 的所有 token。最后一名管理员必须先 `transfer-admin` 才能退出；最后一名成员退出时 channel 整体删除。
 

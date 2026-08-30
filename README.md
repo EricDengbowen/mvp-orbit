@@ -179,6 +179,7 @@ orbit members                  # list members, roles, liveness
 orbit leave                    # leave the channel, revoke own credentials
 orbit remove <alias>           # admin: evict a member, revoke its credentials
 orbit transfer-admin <alias>   # admin: hand over the admin role
+orbit renew                    # swap the saved token for a fresh 7-day one
 ```
 
 Useful `join` options:
@@ -209,7 +210,7 @@ Channel membership is the trust boundary.
 
 - The first client creates the channel, receives a member token, and becomes the channel **admin**.
 - Later clients cannot join until an existing member approves the join request. This includes re-enrollment of an existing alias (e.g. after a token expired): `/api/join` is unauthenticated, so handing out tokens for a claimed alias without approval would let anyone mint a member's credentials. The one exception is a single-member channel re-enrolling its only member — nobody else could approve it. The member token for an approved request is released only to the holder of the claim secret issued with the request (sent via the `X-Orbit-Claim` header), so a request id alone mints nothing.
-- A member token grants access to that channel until it expires or is revoked.
+- A member token grants access to that channel until it expires (7 days) or is revoked. A still-valid token can be swapped for a fresh one at any time (`orbit renew`, no approval — holding a valid token is the proof of identity), and running clients renew automatically once less than 3 days remain, so a continuously-running machine never actually expires. Only a token that has *already* expired requires re-joining with member approval.
 - Any approved member can execute commands on any other connected member.
 - Only admins can `remove` members or change roles; anyone can `leave`. Removing a member (or leaving) revokes that alias's tokens immediately. The last admin must `transfer-admin` before leaving; when the last member leaves, the channel is deleted.
 
