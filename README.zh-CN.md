@@ -208,7 +208,7 @@ orbit exec client-b --shell 'echo hi | wc -c'          # 经 /bin/sh -lc 执行
 Channel 成员关系就是信任边界。
 
 - 第一个 client 创建 channel、获得 member token，并成为 **管理员**。
-- 后续 client 必须被已有成员审批后才能加入。同一 alias 的重新入会（比如 token 过期后重取凭据）同样需要审批——`/api/join` 是匿名接口，若凭 alias 就直接发 token，任何知道 channel 名和成员 alias 的人都能凭空铸造该成员（甚至管理员）的凭据。唯一例外是单成员 channel 给自己重取凭据——因为不存在能审批的其他人。审批通过的 join request id 是一次性的：token 只在第一次轮询时发放。
+- 后续 client 必须被已有成员审批后才能加入。同一 alias 的重新入会（比如 token 过期后重取凭据）同样需要审批——`/api/join` 是匿名接口，若凭 alias 就直接发 token，任何知道 channel 名和成员 alias 的人都能凭空铸造该成员（甚至管理员）的凭据。唯一例外是单成员 channel 给自己重取凭据——因为不存在能审批的其他人。审批通过后，member token 只发放给持有申请时下发的 claim secret 的一方（经 `X-Orbit-Claim` 请求头提交），单凭 request id 铸造不出任何凭据。
 - member token 在过期或被吊销前可访问该 channel。
 - 任意已批准成员都可以对任意在线成员执行命令。
 - 只有管理员可以 `remove` 成员或调整角色；任何人都可以 `leave`。移除成员（或主动退出）会立即吊销该 alias 的所有 token。最后一名管理员必须先 `transfer-admin` 才能退出；最后一名成员退出时 channel 整体删除。

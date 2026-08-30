@@ -353,8 +353,8 @@ class HubStore:
                 # only to whoever holds the claim_secret issued with the
                 # request. Retries are then safe (a lost response can simply be
                 # re-polled) while a request id scraped from logs mints
-                # nothing. Requests created before claim secrets existed fall
-                # back to strict single-use minting.
+                # nothing — including requests created before claim secrets
+                # existed, which can no longer mint at all.
                 stored_secret = row["claim_secret"]
                 if stored_secret is not None and claim_secret is not None and secrets.compare_digest(str(stored_secret), claim_secret):
                     token = self._issue_token_locked(record.channel_id, alias=record.alias)

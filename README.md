@@ -208,7 +208,7 @@ Commands run inside the target client's workspace. `--working-dir` must stay ins
 Channel membership is the trust boundary.
 
 - The first client creates the channel, receives a member token, and becomes the channel **admin**.
-- Later clients cannot join until an existing member approves the join request. This includes re-enrollment of an existing alias (e.g. after a token expired): `/api/join` is unauthenticated, so handing out tokens for a claimed alias without approval would let anyone mint a member's credentials. The one exception is a single-member channel re-enrolling its only member — nobody else could approve it. Approved join-request ids are single-use: the token is minted on the first poll only.
+- Later clients cannot join until an existing member approves the join request. This includes re-enrollment of an existing alias (e.g. after a token expired): `/api/join` is unauthenticated, so handing out tokens for a claimed alias without approval would let anyone mint a member's credentials. The one exception is a single-member channel re-enrolling its only member — nobody else could approve it. The member token for an approved request is released only to the holder of the claim secret issued with the request (sent via the `X-Orbit-Claim` header), so a request id alone mints nothing.
 - A member token grants access to that channel until it expires or is revoked.
 - Any approved member can execute commands on any other connected member.
 - Only admins can `remove` members or change roles; anyone can `leave`. Removing a member (or leaving) revokes that alias's tokens immediately. The last admin must `transfer-admin` before leaving; when the last member leaves, the channel is deleted.
