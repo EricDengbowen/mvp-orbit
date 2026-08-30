@@ -71,16 +71,26 @@ class ClientRuntime:
         env = self._merged_env(lease.env_patch)
         log_kv(logger, logging.INFO, "command.start", client_id=self.client_id, command_id=lease.command_id, cwd=cwd, argv=shlex.join(lease.argv))
 
-        proc = subprocess.Popen(
-            lease.argv,
-            cwd=str(cwd),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            bufsize=0,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                lease.argv,
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                bufsize=0,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # A bad argv (missing binary, permission denied) must still produce a
+            # terminal outcome, otherwise the command stays "running" forever and
+            # the initiator hangs waiting for command.exit.
+            log_kv(logger, logging.WARNING, "command.spawn_failed", client_id=self.client_id, command_id=lease.command_id, error=exc.__class__.__name__, detail=exc)
+            on_started()
+            append_output("stderr", f"orbit: cannot start {lease.argv[0]!r}: {exc}\n")
+            return CommandExecutionOutcome(status=CommandStatus.FAILED, exit_code=127, failure_code="spawn_failed")
         assert proc.stdout is not None
         assert proc.stderr is not None
         on_started()

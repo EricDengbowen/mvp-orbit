@@ -141,6 +141,7 @@ class HubStore:
                     env_patch TEXT NOT NULL,
                     timeout_sec INTEGER NOT NULL,
                     working_dir TEXT NOT NULL,
+                    claim_timeout_sec INTEGER,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     started_at TEXT,
@@ -239,6 +240,17 @@ class HubStore:
                 )
                 """
             )
+            self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        # Databases created before these columns existed are upgraded in place.
+        for statement in (
+            "ALTER TABLE commands ADD COLUMN claim_timeout_sec INTEGER",
+        ):
+            try:
+                self._conn.execute(statement)
+            except sqlite3.OperationalError:
+                pass
 
     def wait_for_updates(self, timeout: float) -> bool:
         with self._updates:
@@ -444,6 +456,7 @@ class HubStore:
             env_patch=request.env_patch,
             timeout_sec=request.timeout_sec,
             working_dir=request.working_dir,
+            claim_timeout_sec=request.claim_timeout_sec,
             status=CommandStatus.QUEUED,
             created_at=now,
             stdout_path=str(stdout_path),
@@ -454,9 +467,9 @@ class HubStore:
                 """
                 INSERT INTO commands (
                     command_id, client_id, channel_id, argv, env_patch, timeout_sec, working_dir,
-                    status, created_at, started_at, finished_at, heartbeat_at, cancel_requested_at,
-                    exit_code, failure_code, stdout_path, stderr_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    claim_timeout_sec, status, created_at, started_at, finished_at, heartbeat_at,
+                    cancel_requested_at, exit_code, failure_code, stdout_path, stderr_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._command_values(record),
             )
@@ -718,15 +731,28 @@ class HubStore:
                 if kind == "command.exit":
                     command_id = str(payload["command_id"])
                     finished = utc_now().isoformat()
-                    self._conn.execute(
+                    updated = self._conn.execute(
                         """
                         UPDATE commands
                         SET status = ?, finished_at = ?, exit_code = ?, failure_code = ?
-                        WHERE command_id = ?
+                        WHERE command_id = ? AND status IN (?, ?)
                         """,
-                        (payload["status"], finished, payload.get("exit_code"), payload.get("failure_code"), command_id),
+                        (
+                            payload["status"],
+                            finished,
+                            payload.get("exit_code"),
+                            payload.get("failure_code"),
+                            command_id,
+                            CommandStatus.QUEUED.value,
+                            CommandStatus.RUNNING.value,
+                        ),
                     )
-                    self._append_command_event_locked(command_id, kind, payload)
+                    if updated.rowcount:
+                        self._append_command_event_locked(command_id, kind, payload)
+                    else:
+                        # Already terminal (e.g. reaped as unclaimed, or canceled):
+                        # a late completion must not resurrect the record.
+                        log_kv(logger, logging.INFO, "command.exit_ignored", command_id=command_id, reported=payload.get("status"))
                     continue
                 if kind == "shell.started":
                     self._append_shell_event_locked(payload["session_id"], kind, payload)
@@ -737,36 +763,55 @@ class HubStore:
                 if kind in {"shell.exit", "shell.closed"}:
                     session_id = str(payload["session_id"])
                     finished = utc_now().isoformat()
-                    self._conn.execute(
+                    updated = self._conn.execute(
                         """
                         UPDATE shell_sessions
                         SET status = ?, finished_at = ?, exit_code = ?, failure_code = ?
-                        WHERE session_id = ?
+                        WHERE session_id = ? AND status IN (?, ?)
                         """,
-                        (payload["status"], finished, payload.get("exit_code"), payload.get("failure_code"), session_id),
+                        (
+                            payload["status"],
+                            finished,
+                            payload.get("exit_code"),
+                            payload.get("failure_code"),
+                            session_id,
+                            ShellSessionStatus.QUEUED.value,
+                            ShellSessionStatus.RUNNING.value,
+                        ),
                     )
-                    self._append_shell_event_locked(session_id, kind, payload)
+                    if updated.rowcount:
+                        self._append_shell_event_locked(session_id, kind, payload)
                     continue
                 if kind == "file.started":
                     transfer_id = str(payload["transfer_id"])
                     now = utc_now().isoformat()
                     self._conn.execute(
-                        "UPDATE file_transfers SET status = ?, started_at = ? WHERE transfer_id = ?",
-                        (FileTransferStatus.RUNNING.value, now, transfer_id),
+                        "UPDATE file_transfers SET status = ?, started_at = ? WHERE transfer_id = ? AND status = ?",
+                        (FileTransferStatus.RUNNING.value, now, transfer_id, FileTransferStatus.QUEUED.value),
                     )
                     continue
                 if kind == "file.result":
                     result = FileTransferResult.model_validate(payload)
                     finished = utc_now().isoformat()
-                    self._conn.execute(
+                    updated = self._conn.execute(
                         """
                         UPDATE file_transfers
                         SET status = ?, finished_at = ?, failure_code = ?, data_b64 = COALESCE(?, data_b64), size = ?
-                        WHERE transfer_id = ?
+                        WHERE transfer_id = ? AND status IN (?, ?)
                         """,
-                        (result.status.value, finished, result.failure_code, result.data_b64, result.size, result.transfer_id),
+                        (
+                            result.status.value,
+                            finished,
+                            result.failure_code,
+                            result.data_b64,
+                            result.size,
+                            result.transfer_id,
+                            FileTransferStatus.QUEUED.value,
+                            FileTransferStatus.RUNNING.value,
+                        ),
                     )
-                    self._append_file_event_locked(result.transfer_id, kind, result.model_dump(mode="json"))
+                    if updated.rowcount:
+                        self._append_file_event_locked(result.transfer_id, kind, result.model_dump(mode="json"))
                     continue
                 raise ValueError(f"unsupported client event kind: {kind}")
         self._notify_update()
@@ -842,6 +887,72 @@ class HubStore:
         if row is None:
             return None
         return self._row_to_file_transfer(dict(row))
+
+    def reap_unclaimed_work(self, *, default_claim_timeout_sec: float) -> int:
+        """Fail QUEUED work nobody claimed in time, so initiators get a terminal
+        event instead of hanging forever on a dead or absent peer."""
+        now = utc_now()
+        reaped = 0
+        with self._lock, self._conn:
+            for row in self._conn.execute("SELECT * FROM commands WHERE status = ?", (CommandStatus.QUEUED.value,)).fetchall():
+                record = self._row_to_command(dict(row))
+                timeout = record.claim_timeout_sec if record.claim_timeout_sec is not None else default_claim_timeout_sec
+                if timeout <= 0 or now - record.created_at < timedelta(seconds=timeout):
+                    continue
+                self._conn.execute(
+                    "UPDATE commands SET status = ?, finished_at = ?, failure_code = ? WHERE command_id = ? AND status = ?",
+                    (CommandStatus.FAILED.value, now.isoformat(), "unclaimed", record.command_id, CommandStatus.QUEUED.value),
+                )
+                self._append_command_event_locked(
+                    record.command_id,
+                    "command.exit",
+                    {"command_id": record.command_id, "status": CommandStatus.FAILED.value, "exit_code": None, "failure_code": "unclaimed"},
+                )
+                log_kv(logger, logging.WARNING, "command.unclaimed", command_id=record.command_id, client_id=record.client_id, timeout_sec=timeout)
+                reaped += 1
+
+            if default_claim_timeout_sec > 0:
+                cutoff = (now - timedelta(seconds=default_claim_timeout_sec)).isoformat()
+                for row in self._conn.execute(
+                    "SELECT * FROM shell_sessions WHERE status = ? AND created_at < ?",
+                    (ShellSessionStatus.QUEUED.value, cutoff),
+                ).fetchall():
+                    record = self._row_to_shell(dict(row))
+                    self._conn.execute(
+                        "UPDATE shell_sessions SET status = ?, finished_at = ?, failure_code = ? WHERE session_id = ?",
+                        (ShellSessionStatus.FAILED.value, now.isoformat(), "unclaimed", record.session_id),
+                    )
+                    self._append_shell_event_locked(
+                        record.session_id,
+                        "shell.exit",
+                        {"session_id": record.session_id, "status": ShellSessionStatus.FAILED.value, "exit_code": None, "failure_code": "unclaimed"},
+                    )
+                    log_kv(logger, logging.WARNING, "shell.unclaimed", session_id=record.session_id, client_id=record.client_id)
+                    reaped += 1
+
+                for row in self._conn.execute(
+                    "SELECT * FROM file_transfers WHERE status = ? AND created_at < ?",
+                    (FileTransferStatus.QUEUED.value, cutoff),
+                ).fetchall():
+                    record = self._row_to_file_transfer(dict(row))
+                    self._conn.execute(
+                        "UPDATE file_transfers SET status = ?, finished_at = ?, failure_code = ? WHERE transfer_id = ?",
+                        (FileTransferStatus.FAILED.value, now.isoformat(), "unclaimed", record.transfer_id),
+                    )
+                    result = FileTransferResult(
+                        transfer_id=record.transfer_id,
+                        status=FileTransferStatus.FAILED,
+                        direction=record.direction,
+                        remote_path=record.remote_path,
+                        size=record.size,
+                        failure_code="unclaimed",
+                    )
+                    self._append_file_event_locked(record.transfer_id, "file.result", result.model_dump(mode="json"))
+                    log_kv(logger, logging.WARNING, "file.unclaimed", transfer_id=record.transfer_id, client_id=record.client_id)
+                    reaped += 1
+        if reaped:
+            self._notify_update()
+        return reaped
 
     def cleanup_empty_channels(self, *, offline_after_sec: float, empty_ttl_sec: float) -> list[str]:
         now = utc_now()
@@ -1039,6 +1150,7 @@ class HubStore:
             json.dumps(record.env_patch),
             record.timeout_sec,
             record.working_dir,
+            record.claim_timeout_sec,
             record.status.value,
             record.created_at.isoformat(),
             record.started_at.isoformat() if record.started_at else None,
@@ -1140,6 +1252,7 @@ class HubStore:
             env_patch=json.loads(row["env_patch"] or "{}"),
             timeout_sec=int(row["timeout_sec"]),
             working_dir=row["working_dir"],
+            claim_timeout_sec=int(row["claim_timeout_sec"]) if row.get("claim_timeout_sec") is not None else None,
             status=CommandStatus(row["status"]),
             created_at=_parse_dt(row["created_at"]),
             started_at=_parse_dt(row["started_at"]),

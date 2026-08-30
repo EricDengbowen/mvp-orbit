@@ -234,7 +234,10 @@ def _command_summary_line(command_id: str, payload: dict) -> str:
         parts.append(f"exit={payload['exit_code']}")
     if payload.get("failure_code"):
         parts.append(f"reason={payload['failure_code']}")
-    return " ".join(parts)
+    line = " ".join(parts)
+    if payload.get("failure_code") == "unclaimed":
+        line += "\n[orbit] the peer never claimed this command — it is offline or its event loop is stuck; check `orbit peers`"
+    return line
 
 
 def _command_result_exit_code(payload: dict) -> int:
@@ -250,6 +253,8 @@ def _command_result_exit_code(payload: dict) -> int:
     if status == CommandStatus.FAILED.value:
         if failure_code == "timeout":
             return 124
+        if failure_code == "unclaimed":
+            return 125
         return _normalize_process_exit_code(exit_code, default=1)
     return 1
 
@@ -289,6 +294,37 @@ def _require_live_member_token(member_token: str | None, expires_at: str | datet
     return member_token
 
 
+def _post_join_with_retry(host: str, request: JoinRequest, *, budget_sec: float = 60.0) -> dict:
+    # Joining is the moment to be tolerant: retry transient network/proxy/5xx
+    # errors with backoff instead of dying on the first blip. (The steady-state
+    # client loop is the opposite: it gives up after repeated failures so a
+    # supervisor can restart it.)
+    deadline = time.monotonic() + budget_sec
+    delay = 1.0
+    while True:
+        try:
+            with httpx.Client(timeout=20) as client:
+                response = client.post(f"{host}/api/join", headers=_headers(None), json=request.model_dump(mode="json"))
+            if response.status_code >= 500:
+                raise httpx.HTTPStatusError("server error", request=response.request, response=response)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                raise
+            last_error = f"HTTP {exc.response.status_code}"
+        except httpx.RequestError as exc:
+            last_error = f"{exc.__class__.__name__}: {exc}"
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"cannot reach hub at {host} after {budget_sec:.0f}s ({last_error}) — "
+                "check the network/proxy environment (a proxy 403 usually means the gateway does not whitelist this host)"
+            )
+        print(f"[orbit] join attempt failed ({last_error}), retrying in {delay:.0f}s", file=sys.stderr)
+        time.sleep(delay)
+        delay = min(8.0, delay * 2)
+
+
 def _run_client_loop(config: OrbitConfig) -> int:
     from mvp_orbit.client.main import main as client_main
 
@@ -312,10 +348,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         alias = wizard.prompt("Local alias", alias, required=True)
         channel = wizard.prompt("Channel name", channel, required=True)
     request = JoinRequest(alias=alias, channel=channel)
-    with httpx.Client(timeout=20) as client:
-        response = client.post(f"{host}/api/join", headers=_headers(None), json=request.model_dump(mode="json"))
-        response.raise_for_status()
-        payload = response.json()
+    payload = _post_join_with_retry(host, request)
 
     if payload["status"] == JoinRequestStatus.PENDING.value:
         request_id = payload["request_id"]
@@ -325,10 +358,14 @@ def cmd_join(args: argparse.Namespace) -> int:
         deadline = time.monotonic() + args.wait_sec
         while time.monotonic() < deadline:
             time.sleep(2.0)
-            with httpx.Client(timeout=20) as client:
-                response = client.get(f"{host}/api/join-requests/{request_id}", headers=_headers(None))
-                response.raise_for_status()
-                payload = response.json()
+            try:
+                with httpx.Client(timeout=20) as client:
+                    response = client.get(f"{host}/api/join-requests/{request_id}", headers=_headers(None))
+                    response.raise_for_status()
+                    payload = response.json()
+            except httpx.RequestError as exc:
+                print(f"[orbit] transient error while waiting for approval ({exc.__class__.__name__}), retrying", file=sys.stderr)
+                continue
             if payload["status"] == JoinRequestStatus.APPROVED.value:
                 break
             if payload["status"] == JoinRequestStatus.REJECTED.value:
@@ -400,6 +437,43 @@ def cmd_peers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _extract_trailing_exec_options(args: argparse.Namespace) -> None:
+    # argparse.REMAINDER swallows everything after the peer name, including
+    # options ("orbit exec peer --shell '…'" used to send the literal string
+    # "--shell" to the peer as argv[0] and hang). Recognize our own options at
+    # the head of the remainder so both placements work.
+    argv = list(args.command_argv or [])
+    valued = {"--timeout-sec": "timeout_sec", "--claim-timeout": "claim_timeout", "--working-dir": "working_dir"}
+    while argv and argv[0] != "--" and argv[0].startswith("--"):
+        option, _, inline_value = argv[0].partition("=")
+        if option == "--shell":
+            args.shell = True
+            argv.pop(0)
+            continue
+        if option in valued:
+            if inline_value:
+                value = inline_value
+                argv.pop(0)
+            elif len(argv) >= 2:
+                value = argv[1]
+                del argv[:2]
+            else:
+                raise SystemExit(f"orbit exec: option {option} requires a value")
+            if option == "--working-dir":
+                args.working_dir = value
+            else:
+                try:
+                    setattr(args, valued[option], int(value))
+                except ValueError:
+                    raise SystemExit(f"orbit exec: option {option} expects an integer, got {value!r}") from None
+            continue
+        raise SystemExit(
+            f"orbit exec: unknown option {option!r} after the peer name — "
+            "place orbit options before the peer, or use `--` to pass literal arguments to the remote command"
+        )
+    args.command_argv = argv
+
+
 def cmd_exec_peer(args: argparse.Namespace) -> int:
     if getattr(args, "to", None):
         if getattr(args, "target", None):
@@ -407,6 +481,7 @@ def cmd_exec_peer(args: argparse.Namespace) -> int:
         args.client_id = args.to
     else:
         args.client_id = args.target
+    _extract_trailing_exec_options(args)
     args.working_dir = args.working_dir or "."
     args.env_file = None
     args.detach = False
@@ -498,6 +573,7 @@ def _command_create_request(args: argparse.Namespace) -> CommandCreateRequest:
         env_patch=_load_json(args.env_file) if args.env_file else {},
         timeout_sec=args.timeout_sec,
         working_dir=args.working_dir,
+        claim_timeout_sec=getattr(args, "claim_timeout", None),
     )
 
 
@@ -560,38 +636,88 @@ def _iter_sse_events(response: httpx.Response) -> list[dict]:
         block.append(line)
 
 
-def _follow_file_transfer(hub_url: str, member_token: str, transfer_id: str) -> dict:
-    timeout = httpx.Timeout(connect=5.0, read=None, write=5.0, pool=5.0)
+def _follow_stream(hub_url: str, member_token: str, path: str, on_event) -> dict | None:
+    """Consume an SSE stream until on_event returns a terminal payload.
+
+    The hub emits a keepalive at least every 5s, so a finite read timeout only
+    fires when the connection is actually dead; then we reconnect with
+    Last-Event-ID (events are persisted server-side, nothing is lost) and give
+    up loudly after repeated failures instead of hanging forever.
+    Returns None when the server closes the stream without a terminal event.
+    """
+    timeout = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
+    last_event_id: str | None = None
+    failures = 0
     with httpx.Client(timeout=timeout) as client:
-        with client.stream(
-            "GET",
-            f"{hub_url}/api/files/{transfer_id}/stream",
-            headers=_headers(member_token) | {"Accept": "text/event-stream"},
-        ) as response:
-            response.raise_for_status()
-            for event in _iter_sse_events(response):
-                if event["event"] == "file.result":
-                    return event["payload"]
+        while True:
+            headers = _headers(member_token) | {"Accept": "text/event-stream"}
+            if last_event_id:
+                headers["Last-Event-ID"] = last_event_id
+            try:
+                with client.stream("GET", f"{hub_url}{path}", headers=headers) as response:
+                    response.raise_for_status()
+                    failures = 0
+                    for event in _iter_sse_events(response):
+                        if event.get("id"):
+                            last_event_id = event["id"]
+                        result = on_event(event)
+                        if result is not None:
+                            return result
+                return None
+            except httpx.RequestError as exc:
+                failures += 1
+                if failures >= 6:
+                    raise RuntimeError(
+                        f"lost connection to hub while streaming {path} ({exc.__class__.__name__}: {exc})"
+                    ) from exc
+                print(f"[orbit] stream interrupted ({exc.__class__.__name__}), reconnecting", file=sys.stderr, flush=True)
+                time.sleep(min(10.0, 2.0 ** failures))
+
+
+def _fetch_json(hub_url: str, member_token: str, path: str) -> dict:
+    with httpx.Client(timeout=20) as client:
+        response = client.get(f"{hub_url}{path}", headers=_headers(member_token))
+        response.raise_for_status()
+        return response.json()
+
+
+def _follow_file_transfer(hub_url: str, member_token: str, transfer_id: str) -> dict:
+    def on_event(event: dict) -> dict | None:
+        if event["event"] == "file.result":
+            return event["payload"]
+        return None
+
+    result = _follow_stream(hub_url, member_token, f"/api/files/{transfer_id}/stream", on_event)
+    if result is not None:
+        return result
+    record = _fetch_json(hub_url, member_token, f"/api/files/{transfer_id}")
+    if record.get("status") in {FileTransferStatus.SUCCEEDED.value, FileTransferStatus.FAILED.value}:
+        return record
     raise RuntimeError(f"file transfer stream ended before terminal event for {transfer_id}")
 
 
 def _follow_command_output(hub_url: str, member_token: str, command_id: str) -> dict:
-    timeout = httpx.Timeout(connect=5.0, read=None, write=5.0, pool=5.0)
-    with httpx.Client(timeout=timeout) as client:
-        with client.stream(
-            "GET",
-            f"{hub_url}/api/commands/{command_id}/stream",
-            headers=_headers(member_token) | {"Accept": "text/event-stream"},
-        ) as response:
-            response.raise_for_status()
-            for event in _iter_sse_events(response):
-                payload = event["payload"]
-                if event["event"] == "command.stdout":
-                    print(payload.get("data", ""), end="", file=sys.stdout, flush=True)
-                elif event["event"] == "command.stderr":
-                    print(payload.get("data", ""), end="", file=sys.stderr, flush=True)
-                elif event["event"] == "command.exit":
-                    return payload
+    def on_event(event: dict) -> dict | None:
+        payload = event["payload"]
+        if event["event"] == "command.stdout":
+            print(payload.get("data", ""), end="", file=sys.stdout, flush=True)
+        elif event["event"] == "command.stderr":
+            print(payload.get("data", ""), end="", file=sys.stderr, flush=True)
+        elif event["event"] == "command.exit":
+            return payload
+        return None
+
+    result = _follow_stream(hub_url, member_token, f"/api/commands/{command_id}/stream", on_event)
+    if result is not None:
+        return result
+    record = _fetch_json(hub_url, member_token, f"/api/commands/{command_id}")
+    if _is_terminal_command_status(str(record.get("status"))):
+        return {
+            "command_id": command_id,
+            "status": record.get("status"),
+            "exit_code": record.get("exit_code"),
+            "failure_code": record.get("failure_code"),
+        }
     raise RuntimeError(f"command stream ended before terminal event for {command_id}")
 
 
@@ -630,26 +756,21 @@ def _attach_shell(hub_url: str, member_token: str, session_id: str) -> None:
     stream_error: list[BaseException] = []
 
     def consume_events() -> None:
-        timeout = httpx.Timeout(connect=5.0, read=None, write=5.0, pool=5.0)
+        def on_event(event: dict) -> dict | None:
+            payload = event["payload"]
+            if event["event"] == "shell.stdout":
+                print(payload.get("data", ""), end="", file=sys.stdout, flush=True)
+            elif event["event"] == "shell.stderr":
+                print(payload.get("data", ""), end="", file=sys.stderr, flush=True)
+            elif event["event"] in {"shell.closed", "shell.exit"}:
+                return payload
+            return None
+
         try:
-            with httpx.Client(timeout=timeout) as client:
-                with client.stream(
-                    "GET",
-                    f"{hub_url}/api/shells/{session_id}/stream",
-                    headers=_headers(member_token) | {"Accept": "text/event-stream"},
-                ) as response:
-                    response.raise_for_status()
-                    for event in _iter_sse_events(response):
-                        payload = event["payload"]
-                        if event["event"] == "shell.stdout":
-                            print(payload.get("data", ""), end="", file=sys.stdout, flush=True)
-                        elif event["event"] == "shell.stderr":
-                            print(payload.get("data", ""), end="", file=sys.stderr, flush=True)
-                        elif event["event"] in {"shell.closed", "shell.exit"}:
-                            stop.set()
-                            break
+            _follow_stream(hub_url, member_token, f"/api/shells/{session_id}/stream", on_event)
         except BaseException as exc:
             stream_error.append(exc)
+        finally:
             stop.set()
 
     thread = threading.Thread(target=consume_events, daemon=True)
@@ -766,6 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
     exec_cmd.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     exec_cmd.add_argument("--working-dir", default=".")
     exec_cmd.add_argument("--timeout-sec", type=int, default=3600)
+    exec_cmd.add_argument("--claim-timeout", type=int, default=None, help="fail fast if no peer claims the command within N seconds (default: hub setting, 30s)")
     exec_cmd.add_argument("--shell", action="store_true", help="run the trailing command through /bin/sh -lc on the peer")
     exec_cmd.add_argument("target")
     exec_cmd.add_argument("command_argv", nargs=argparse.REMAINDER)

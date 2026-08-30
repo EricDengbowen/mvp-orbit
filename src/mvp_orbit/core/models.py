@@ -103,6 +103,8 @@ class CommandCreateRequest(BaseModel):
     env_patch: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int = Field(default=3600, ge=1, le=86400)
     working_dir: str = "."
+    # None = use the hub-wide default (ORBIT_CLAIM_TIMEOUT_SEC).
+    claim_timeout_sec: int | None = Field(default=None, ge=1, le=86400)
 
 
 class CommandRecord(BaseModel):
@@ -115,6 +117,7 @@ class CommandRecord(BaseModel):
     env_patch: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int
     working_dir: str
+    claim_timeout_sec: int | None = None
     status: CommandStatus
     created_at: datetime
     started_at: datetime | None = None

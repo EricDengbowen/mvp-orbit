@@ -11,14 +11,30 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from mvp_orbit.client.runtime import ClientRuntime
+from mvp_orbit.client.runtime import ClientRuntime, CommandExecutionOutcome, ShellExecutionOutcome
 from mvp_orbit.core.logging import log_kv
-from mvp_orbit.core.models import ClientEvent, ClientEventsRequest, CommandLease, FileTransferResult, ShellSessionLease
+from mvp_orbit.core.models import (
+    ClientEvent,
+    ClientEventsRequest,
+    CommandLease,
+    CommandStatus,
+    FileTransferResult,
+    ShellSessionLease,
+    ShellSessionStatus,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class TokenExpiredError(RuntimeError):
+    pass
+
+
+class TokenRejectedError(RuntimeError):
+    pass
+
+
+class StreamFailureLimitError(RuntimeError):
     pass
 
 
@@ -53,11 +69,16 @@ class ClientService:
     member_token: str | None = None
     heartbeat_interval_sec: float = 15.0
     join_request_prompt: Callable[[dict], bool | None] | None = None
+    # Consecutive stream failures tolerated before giving up (0 = retry forever).
+    # Giving up with a non-zero exit is deliberate: it hands recovery to an
+    # external supervisor instead of spinning on a dead proxy environment.
+    max_stream_failures: int = 10
 
     def __post_init__(self) -> None:
         self._command_cancels: dict[str, threading.Event] = {}
         self._shell_controls: dict[str, _ShellControl] = {}
         self._last_event_id = 0
+        self._stream_connected = False
 
     def _headers(self, *, accept: str = "application/json") -> dict[str, str]:
         headers = {"Accept": accept}
@@ -73,16 +94,46 @@ class ClientService:
         heartbeat_thread.start()
         if client is None:
             client = httpx.Client(timeout=timeout)
+        consecutive_failures = 0
         try:
             while True:
+                self._stream_connected = False
                 try:
                     self._consume_stream(client)
+                    consecutive_failures = 0
                 except TokenExpiredError as exc:
-                    log_kv(logger, logging.ERROR, "client.token_expired", client_id=self.client_id, action="run orbit join again")
-                    raise RuntimeError("token expired") from exc
+                    log_kv(logger, logging.ERROR, "client.token_expired", client_id=self.client_id, action="run `orbit join --no-start` again")
+                    raise RuntimeError("member token expired — run `orbit join --no-start` on this machine, then restart the client") from exc
+                except TokenRejectedError as exc:
+                    log_kv(logger, logging.ERROR, "client.token_rejected", client_id=self.client_id, action="run `orbit join --no-start` again")
+                    raise RuntimeError(
+                        "hub rejected the member token (client evicted or channel pruned) — "
+                        "run `orbit join --no-start` on this machine to re-enroll, then restart the client"
+                    ) from exc
                 except (httpx.RequestError, httpx.HTTPStatusError) as exc:
-                    log_kv(logger, logging.WARNING, "client.stream_error", client_id=self.client_id, error=exc.__class__.__name__, detail=exc)
-                    time.sleep(1.0)
+                    # A failure that follows an established stream starts a new
+                    # streak; only never-connecting attempts accumulate. This is
+                    # what lets a supervisor take over when the network
+                    # environment itself has gone bad (e.g. a proxy now
+                    # answering 403), instead of retrying it forever.
+                    consecutive_failures = 1 if self._stream_connected else consecutive_failures + 1
+                    log_kv(
+                        logger,
+                        logging.WARNING,
+                        "client.stream_error",
+                        client_id=self.client_id,
+                        error=exc.__class__.__name__,
+                        detail=exc,
+                        failures=consecutive_failures,
+                        limit=self.max_stream_failures or "unlimited",
+                    )
+                    if self.max_stream_failures and consecutive_failures >= self.max_stream_failures:
+                        log_kv(logger, logging.ERROR, "client.stream_gave_up", client_id=self.client_id, failures=consecutive_failures)
+                        raise StreamFailureLimitError(
+                            f"giving up after {consecutive_failures} consecutive stream failures "
+                            f"(last: {exc.__class__.__name__}: {exc}) — exiting so a supervisor can restart with a fresh environment"
+                        ) from exc
+                    time.sleep(min(60.0, 2.0 ** min(consecutive_failures - 1, 6)))
         finally:
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=2.0)
@@ -110,6 +161,7 @@ class ClientService:
             headers=headers,
         ) as response:
             self._raise_for_status(response)
+            self._stream_connected = True
             block: list[str] = []
             for line in response.iter_lines():
                 if line == "":
@@ -237,18 +289,24 @@ class ClientService:
         except ValueError:
             self._command_cancels.pop(command_id, None)
             return
-        outcome = self.runtime.handle_command(
-            lease,
-            on_started=lambda: self._post_client_events(
-                client,
-                [ClientEvent(kind="command.started", payload={"command_id": command_id})],
-            ),
-            append_output=lambda stream, data: self._post_client_events(
-                client,
-                [ClientEvent(kind=f"command.{stream}", payload={"command_id": command_id, "data": data})],
-            ),
-            should_cancel=cancel_event.is_set,
-        )
+        try:
+            outcome = self.runtime.handle_command(
+                lease,
+                on_started=lambda: self._post_client_events(
+                    client,
+                    [ClientEvent(kind="command.started", payload={"command_id": command_id})],
+                ),
+                append_output=lambda stream, data: self._post_client_events(
+                    client,
+                    [ClientEvent(kind=f"command.{stream}", payload={"command_id": command_id, "data": data})],
+                ),
+                should_cancel=cancel_event.is_set,
+            )
+        except Exception as exc:
+            # A crashed worker must still report a terminal status; a claimed
+            # command left "running" hangs the initiator forever.
+            log_kv(logger, logging.ERROR, "command.runtime_error", client_id=self.client_id, command_id=command_id, error=exc.__class__.__name__, detail=exc)
+            outcome = CommandExecutionOutcome(status=CommandStatus.FAILED, exit_code=1, failure_code=f"runtime_error:{exc.__class__.__name__}")
         self._post_client_events(
             client,
             [
@@ -271,20 +329,24 @@ class ClientService:
         except ValueError:
             self._shell_controls.pop(session_id, None)
             return
-        outcome = self.runtime.handle_shell_session(
-            lease,
-            on_started=lambda: self._post_client_events(
-                client,
-                [ClientEvent(kind="shell.started", payload={"session_id": session_id})],
-            ),
-            append_output=lambda data: self._post_client_events(
-                client,
-                [ClientEvent(kind="shell.stdout", payload={"session_id": session_id, "data": data})],
-            ),
-            pop_input=control.pop_inputs,
-            pop_resize=control.pop_resizes,
-            should_close=control.close_requested.is_set,
-        )
+        try:
+            outcome = self.runtime.handle_shell_session(
+                lease,
+                on_started=lambda: self._post_client_events(
+                    client,
+                    [ClientEvent(kind="shell.started", payload={"session_id": session_id})],
+                ),
+                append_output=lambda data: self._post_client_events(
+                    client,
+                    [ClientEvent(kind="shell.stdout", payload={"session_id": session_id, "data": data})],
+                ),
+                pop_input=control.pop_inputs,
+                pop_resize=control.pop_resizes,
+                should_close=control.close_requested.is_set,
+            )
+        except Exception as exc:
+            log_kv(logger, logging.ERROR, "shell.runtime_error", client_id=self.client_id, session_id=session_id, error=exc.__class__.__name__, detail=exc)
+            outcome = ShellExecutionOutcome(status=ShellSessionStatus.FAILED, exit_code=1, failure_code=f"runtime_error:{exc.__class__.__name__}")
         final_kind = "shell.closed" if outcome.status.value == "closed" else "shell.exit"
         self._post_client_events(
             client,
@@ -381,9 +443,11 @@ class ClientService:
         if response.status_code == 401:
             detail = None
             try:
+                response.read()
                 detail = response.json().get("detail")
             except Exception:
                 detail = None
             if detail == "token expired":
                 raise TokenExpiredError(detail)
+            raise TokenRejectedError(detail or "unauthorized")
         response.raise_for_status()

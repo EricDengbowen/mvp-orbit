@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -47,8 +48,13 @@ def main() -> None:
         runtime=runtime,
         member_token=member_token,
         heartbeat_interval_sec=float(os.getenv("ORBIT_HEARTBEAT_SEC", "15")),
+        max_stream_failures=int(os.getenv("ORBIT_MAX_STREAM_FAILURES", "10")),
     )
-    service.run_forever()
+    try:
+        service.run_forever()
+    except RuntimeError as exc:
+        print(f"[orbit] client stopped: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(3) from exc
 
 
 if __name__ == "__main__":

@@ -140,6 +140,7 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
     cleanup_interval_sec = float(os.getenv("ORBIT_CHANNEL_CLEANUP_INTERVAL_SEC", "60"))
     client_offline_sec = float(os.getenv("ORBIT_CLIENT_OFFLINE_SEC", "90"))
     channel_empty_ttl_sec = float(os.getenv("ORBIT_CHANNEL_EMPTY_TTL_SEC", "3600"))
+    claim_timeout_sec = float(os.getenv("ORBIT_CLAIM_TIMEOUT_SEC", "30"))
 
     async def _channel_cleanup_loop() -> None:
         interval = max(1.0, cleanup_interval_sec)
@@ -151,13 +152,23 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
                 empty_ttl_sec=channel_empty_ttl_sec,
             )
 
+    async def _unclaimed_reaper_loop() -> None:
+        interval = max(1.0, min(claim_timeout_sec / 2.0, 10.0))
+        while True:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(store.reap_unclaimed_work, default_claim_timeout_sec=claim_timeout_sec)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        task = asyncio.create_task(_channel_cleanup_loop()) if cleanup_enabled else None
+        tasks = []
+        if cleanup_enabled:
+            tasks.append(asyncio.create_task(_channel_cleanup_loop()))
+        if claim_timeout_sec > 0:
+            tasks.append(asyncio.create_task(_unclaimed_reaper_loop()))
         try:
             yield
         finally:
-            if task is not None:
+            for task in tasks:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
