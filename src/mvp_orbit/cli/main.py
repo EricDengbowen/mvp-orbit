@@ -434,6 +434,9 @@ def cmd_join(args: argparse.Namespace) -> int:
         and (args.host is None or args.host in (config.hub.url, config.hub.resolved_url()))
         and (channel is None or (config.client.channel is not None and config.client.channel == channel))
     ):
+        if getattr(args, "env_refresh_cmd", None):
+            config.client.env_refresh_cmd = args.env_refresh_cmd
+            save_config(config, config_path)
         try:
             if _renew_if_needed(str(config_path)):
                 _, config = load_config(config_path)
@@ -523,6 +526,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         # Pin the workspace at join time; otherwise put/get land wherever the
         # client process happened to be started from on any given day.
         config.client.workspace_root = str(Path.cwd())
+    if getattr(args, "env_refresh_cmd", None):
+        config.client.env_refresh_cmd = args.env_refresh_cmd
     saved_path = save_config(config, config_path)
     print(
         json.dumps(
@@ -1058,6 +1063,38 @@ def _force_runtime_env(config: OrbitConfig) -> None:
             os.environ[name] = str(value)
 
 
+def _refresh_environment(cmd: str) -> None:
+    """Run the user-supplied refresh command and adopt the environment it
+    produces (e.g. `source proxy.sh` picking up a rotated gateway). The
+    command's own output goes to stderr; we read the resulting env after it.
+    ORBIT_* variables stay owned by the config."""
+    result = subprocess.run(
+        ["bash", "-lc", "{ " + cmd + " ; } 1>&2; env -0"],
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        print(f"[orbit-daemon] env refresh command failed (exit {result.returncode}); keeping the current environment", flush=True)
+        return
+    changed = 0
+    for chunk in result.stdout.split(b"\0"):
+        if not chunk or b"=" not in chunk:
+            continue
+        key, _, value = chunk.partition(b"=")
+        try:
+            name = key.decode()
+            text = value.decode()
+        except UnicodeDecodeError:
+            continue
+        if name.startswith("ORBIT_") or name in {"_", "SHLVL", "PWD", "OLDPWD"}:
+            continue
+        if os.environ.get(name) != text:
+            os.environ[name] = text
+            changed += 1
+    if changed:
+        print(f"[orbit-daemon] environment refreshed ({changed} variables updated)", flush=True)
+
+
 def _daemon_paths(config_path: str):
     from mvp_orbit.client.service import state_dir
 
@@ -1148,6 +1185,11 @@ def cmd_daemon_supervise(args: argparse.Namespace) -> int:
             if config.auth.expires_at is None or config.auth.expires_at <= utc_now():
                 print("[orbit-daemon] member token expired — run `orbit join` again, then restart the daemon", flush=True)
                 break
+            if config.client.env_refresh_cmd:
+                try:
+                    _refresh_environment(config.client.env_refresh_cmd)
+                except Exception as exc:  # noqa: BLE001 — a broken refresh must not kill the daemon
+                    print(f"[orbit-daemon] env refresh errored ({exc.__class__.__name__}: {exc}); keeping the current environment", flush=True)
             _force_runtime_env(config)
             started = time.monotonic()
             try:
@@ -1283,6 +1325,7 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--no-start", action="store_true", help="join and save config without starting the client loop")
     join.add_argument("--daemon", action="store_true", help="run the client loop as a supervised background daemon (auto-restart, log under ~/.local/state/mvp-orbit)")
     join.add_argument("--force-rejoin", action="store_true", help="request fresh credentials even when valid saved ones exist (needs member approval)")
+    join.add_argument("--env-refresh-cmd", default=None, help="shell command the daemon runs before each client restart to refresh the environment (e.g. 'source /path/proxy.sh')")
     join.set_defaults(func=cmd_join)
 
     renew = sub.add_parser("renew", help="swap the saved member token for a fresh 7-day one (needs the current token to still be valid)")

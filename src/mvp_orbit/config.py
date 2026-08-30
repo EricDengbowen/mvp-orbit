@@ -37,6 +37,10 @@ class ClientConfig(BaseModel):
     id: str | None = None
     workspace_root: str | None = None
     channel: str | None = None
+    # Shell command the daemon runs before each client (re)start to refresh
+    # the process environment (e.g. "source /path/to/proxy.sh"). Keeps orbit
+    # decoupled from proxy specifics while still healing gateway rotations.
+    env_refresh_cmd: str | None = None
 
 
 class OrbitConfig(BaseModel):

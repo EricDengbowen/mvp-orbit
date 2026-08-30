@@ -242,3 +242,33 @@ def test_unclaimed_shell_and_file_are_reaped(tmp_path):
     file_events = store.get_file_events(push["transfer_id"], 0)
     assert file_events[-1].kind == "file.result"
     assert file_events[-1].payload["failure_code"] == "unclaimed"
+
+
+def test_env_refresh_adopts_new_variables_and_protects_orbit_vars():
+    import os
+
+    from mvp_orbit.cli.main import _refresh_environment
+
+    os.environ["ORBIT_TEST_PROTECTED"] = "original"
+    try:
+        _refresh_environment("export ORBIT_TEST_PROTECTED=hacked; export ORBIT_REFRESH_PROBE_XYZ=fresh-value; echo noise")
+        assert "ORBIT_REFRESH_PROBE_XYZ" not in os.environ  # ORBIT_ prefix is never adopted
+        assert os.environ["ORBIT_TEST_PROTECTED"] == "original"
+        _refresh_environment("export REFRESH_PROBE_PLAIN_XYZ=fresh-value")
+        assert os.environ["REFRESH_PROBE_PLAIN_XYZ"] == "fresh-value"
+    finally:
+        os.environ.pop("ORBIT_TEST_PROTECTED", None)
+        os.environ.pop("REFRESH_PROBE_PLAIN_XYZ", None)
+
+
+def test_env_refresh_failure_keeps_environment():
+    import os
+
+    from mvp_orbit.cli.main import _refresh_environment
+
+    os.environ["REFRESH_KEEP_XYZ"] = "keep"
+    try:
+        _refresh_environment("exit 7")  # failing refresh must change nothing
+        assert os.environ["REFRESH_KEEP_XYZ"] == "keep"
+    finally:
+        os.environ.pop("REFRESH_KEEP_XYZ", None)

@@ -190,6 +190,9 @@ orbit join --no-wait    # 提交加入申请后立即退出
 orbit join --daemon     # 以受监护的后台守护进程方式运行 client loop
                         # （退避自动重启，pidfile 和日志在
                         #   ~/.local/state/mvp-orbit/ 下）
+orbit join --daemon --env-refresh-cmd 'source /path/proxy.sh'
+                        # 每次重启 client 前先执行给定命令并采纳其产生的环境——
+                        # 代理网关/凭据轮换后自动恢复，orbit 本身仍完全不懂 proxy
 ```
 
 常用 `exec` 选项（写在 peer 名前后都可以）：

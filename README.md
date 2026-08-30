@@ -190,6 +190,11 @@ orbit join --no-wait    # submit a join request and exit immediately
 orbit join --daemon     # run the client loop as a supervised background daemon
                         # (auto-restart with backoff, pidfile + log under
                         #  ~/.local/state/mvp-orbit/)
+orbit join --daemon --env-refresh-cmd 'source /path/proxy.sh'
+                        # additionally re-run the given shell command before
+                        # every client restart and adopt the environment it
+                        # produces — heals rotated proxy gateways/credentials
+                        # without orbit knowing anything about proxies
 ```
 
 Useful `exec` options (accepted before or after the peer name):
