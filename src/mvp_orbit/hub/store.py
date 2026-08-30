@@ -59,6 +59,9 @@ class MembershipError(Exception):
 class AuthenticatedMember:
     channel_id: str
     expires_at: datetime
+    # None for tokens minted before member management existed; such tokens can
+    # use everything except the member-management endpoints.
+    alias: str | None = None
 
 
 class HubStore:
@@ -247,11 +250,33 @@ class HubStore:
         for statement in (
             "ALTER TABLE commands ADD COLUMN claim_timeout_sec INTEGER",
             "ALTER TABLE clients ADD COLUMN stream_connected INTEGER",
+            "ALTER TABLE channel_members ADD COLUMN role TEXT NOT NULL DEFAULT 'member'",
+            "ALTER TABLE member_tokens ADD COLUMN alias TEXT",
         ):
             try:
                 self._conn.execute(statement)
             except sqlite3.OperationalError:
                 pass
+        # Channels from before roles existed: the first member has always been
+        # the de-facto admin, so make that explicit.
+        channels = self._conn.execute(
+            """
+            SELECT DISTINCT channel_id FROM channel_members cm
+            WHERE NOT EXISTS (
+                SELECT 1 FROM channel_members WHERE channel_id = cm.channel_id AND role = 'admin'
+            )
+            """
+        ).fetchall()
+        for row in channels:
+            first = self._conn.execute(
+                "SELECT alias FROM channel_members WHERE channel_id = ? ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                (row["channel_id"],),
+            ).fetchone()
+            if first is not None:
+                self._conn.execute(
+                    "UPDATE channel_members SET role = 'admin' WHERE channel_id = ? AND alias = ?",
+                    (row["channel_id"], first["alias"]),
+                )
 
     def wait_for_updates(self, timeout: float) -> bool:
         with self._updates:
@@ -261,9 +286,9 @@ class HubStore:
         channel_id = self.channel_id_for_name(channel)
         with self._lock, self._conn:
             if self._channel_member_count_locked(channel_id) == 0:
-                self._insert_channel_member_locked(channel_id, alias)
+                self._insert_channel_member_locked(channel_id, alias, role="admin")
                 token = self._issue_token_locked(channel_id, alias=alias)
-                log_kv(logger, logging.INFO, "join.auto_approved", channel_id=channel_id, alias=alias)
+                log_kv(logger, logging.INFO, "join.auto_approved", channel_id=channel_id, alias=alias, role="admin")
                 return JoinResponse(
                     status=JoinRequestStatus.APPROVED,
                     alias=alias,
@@ -384,7 +409,7 @@ class HubStore:
         token_hash = self._hash_token(member_token)
         with self._lock:
             row = self._conn.execute(
-                "SELECT channel_id, expires_at, revoked_at FROM member_tokens WHERE token_hash = ?",
+                "SELECT channel_id, expires_at, revoked_at, alias FROM member_tokens WHERE token_hash = ?",
                 (token_hash,),
             ).fetchone()
         if row is None or row["revoked_at"] is not None:
@@ -393,7 +418,8 @@ class HubStore:
         assert expires_at is not None
         if expires_at <= utc_now():
             raise ExpiredTokenError("token expired")
-        return AuthenticatedMember(channel_id=str(row["channel_id"]), expires_at=expires_at)
+        alias = row["alias"]
+        return AuthenticatedMember(channel_id=str(row["channel_id"]), expires_at=expires_at, alias=str(alias) if alias else None)
 
     def ensure_channel(self, channel_id: str) -> ChannelRecord:
         now = utc_now()
@@ -896,6 +922,112 @@ class HubStore:
             return None
         return self._row_to_file_transfer(dict(row))
 
+    def list_members(self, channel_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT m.alias, m.role, m.created_at AS joined_at,
+                       c.last_seen_at, c.stream_connected
+                FROM channel_members m
+                LEFT JOIN clients c ON c.channel_id = m.channel_id AND c.client_id = m.alias
+                WHERE m.channel_id = ?
+                ORDER BY m.created_at ASC, m.rowid ASC
+                """,
+                (channel_id,),
+            ).fetchall()
+        members = []
+        for row in rows:
+            stream_connected = row["stream_connected"]
+            members.append(
+                {
+                    "alias": row["alias"],
+                    "role": row["role"],
+                    "joined_at": row["joined_at"],
+                    "last_seen_at": row["last_seen_at"],
+                    "stream_connected": None if stream_connected is None else bool(stream_connected),
+                }
+            )
+        return members
+
+    def _member_role_locked(self, channel_id: str, alias: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT role FROM channel_members WHERE channel_id = ? AND alias = ?",
+            (channel_id, alias),
+        ).fetchone()
+        return None if row is None else str(row["role"])
+
+    def _admin_count_locked(self, channel_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS count FROM channel_members WHERE channel_id = ? AND role = 'admin'",
+            (channel_id,),
+        ).fetchone()
+        return int(row["count"])
+
+    def _evict_member_locked(self, channel_id: str, alias: str) -> None:
+        # Revoking the tokens takes effect on the member's very next request.
+        now = utc_now().isoformat()
+        self._conn.execute(
+            "UPDATE member_tokens SET revoked_at = ? WHERE channel_id = ? AND alias = ? AND revoked_at IS NULL",
+            (now, channel_id, alias),
+        )
+        client_ids = [
+            str(row["client_id"])
+            for row in self._conn.execute(
+                "SELECT client_id FROM clients WHERE channel_id = ? AND client_id = ?",
+                (channel_id, alias),
+            ).fetchall()
+        ]
+        self._delete_where_in_locked("client_control_events", "client_id", client_ids)
+        self._conn.execute("DELETE FROM clients WHERE channel_id = ? AND client_id = ?", (channel_id, alias))
+        self._conn.execute("DELETE FROM channel_members WHERE channel_id = ? AND alias = ?", (channel_id, alias))
+
+    def leave_channel(self, channel_id: str, alias: str) -> dict:
+        with self._lock, self._conn:
+            role = self._member_role_locked(channel_id, alias)
+            if role is None:
+                raise MembershipError(f"{alias!r} is not a member of this channel")
+            member_count = self._channel_member_count_locked(channel_id)
+            if member_count > 1 and role == "admin" and self._admin_count_locked(channel_id) == 1:
+                raise ValueError("you are the only admin — run `orbit transfer-admin <alias>` before leaving")
+            self._evict_member_locked(channel_id, alias)
+            channel_deleted = member_count == 1
+            if channel_deleted:
+                self._delete_channel_locked(channel_id)
+            log_kv(logger, logging.INFO, "member.left", channel_id=channel_id, alias=alias, channel_deleted=channel_deleted)
+        self._notify_update()
+        return {"status": "left", "alias": alias, "channel_id": channel_id, "channel_deleted": channel_deleted}
+
+    def remove_member(self, channel_id: str, actor_alias: str, target_alias: str) -> dict:
+        with self._lock, self._conn:
+            if self._member_role_locked(channel_id, actor_alias) != "admin":
+                raise MembershipError("admin role required to remove members")
+            if actor_alias == target_alias:
+                raise ValueError("cannot remove yourself — use `orbit leave`")
+            if self._member_role_locked(channel_id, target_alias) is None:
+                raise KeyError(target_alias)
+            self._evict_member_locked(channel_id, target_alias)
+            log_kv(logger, logging.INFO, "member.removed", channel_id=channel_id, alias=target_alias, by=actor_alias)
+        self._notify_update()
+        return {"status": "removed", "alias": target_alias, "channel_id": channel_id, "channel_deleted": False}
+
+    def set_member_role(self, channel_id: str, actor_alias: str, target_alias: str, role: str) -> dict:
+        if role not in {"admin", "member"}:
+            raise ValueError(f"unknown role {role!r}")
+        with self._lock, self._conn:
+            if self._member_role_locked(channel_id, actor_alias) != "admin":
+                raise MembershipError("admin role required to change roles")
+            if self._member_role_locked(channel_id, target_alias) is None:
+                raise KeyError(target_alias)
+            if role == "member" and actor_alias == target_alias and self._admin_count_locked(channel_id) == 1:
+                raise ValueError("you are the only admin — promote someone else first")
+            self._conn.execute(
+                "UPDATE channel_members SET role = ? WHERE channel_id = ? AND alias = ?",
+                (role, channel_id, target_alias),
+            )
+            log_kv(logger, logging.INFO, "member.role_changed", channel_id=channel_id, alias=target_alias, role=role, by=actor_alias)
+        self._notify_update()
+        return {"status": "role_changed", "alias": target_alias, "channel_id": channel_id, "role": role}
+
     def reap_unclaimed_work(self, *, default_claim_timeout_sec: float) -> int:
         """Fail QUEUED work nobody claimed in time, so initiators get a terminal
         event instead of hanging forever on a dead or absent peer."""
@@ -1047,15 +1179,15 @@ class HubStore:
             (channel_id, utc_now().isoformat()),
         )
 
-    def _insert_channel_member_locked(self, channel_id: str, alias: str) -> None:
+    def _insert_channel_member_locked(self, channel_id: str, alias: str, *, role: str = "member") -> None:
         self._ensure_channel_locked(channel_id)
         self._conn.execute(
             """
-            INSERT INTO channel_members (channel_id, alias, created_at)
-            VALUES (?, ?, ?)
+            INSERT INTO channel_members (channel_id, alias, created_at, role)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(channel_id, alias) DO NOTHING
             """,
-            (channel_id, alias, utc_now().isoformat()),
+            (channel_id, alias, utc_now().isoformat(), role),
         )
 
     def _issue_token_locked(self, channel_id: str, *, alias: str | None = None) -> TokenResponse:
@@ -1065,10 +1197,10 @@ class HubStore:
         member_token = secrets.token_urlsafe(32)
         self._conn.execute(
             """
-            INSERT INTO member_tokens (token_hash, channel_id, created_at, expires_at, revoked_at)
-            VALUES (?, ?, ?, ?, NULL)
+            INSERT INTO member_tokens (token_hash, channel_id, created_at, expires_at, revoked_at, alias)
+            VALUES (?, ?, ?, ?, NULL, ?)
             """,
-            (self._hash_token(member_token), channel_id, created_at.isoformat(), expires_at.isoformat()),
+            (self._hash_token(member_token), channel_id, created_at.isoformat(), expires_at.isoformat(), alias),
         )
         return TokenResponse(channel_id=channel_id, member_token=member_token, expires_at=expires_at, alias=alias)
 

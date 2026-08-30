@@ -23,14 +23,17 @@ Run one control `host`, let multiple `client` machines join the same channel, ap
 ## Features
 
 - Simple join flow: `host URL` + local `alias` + `channel` name.
-- First client in a channel is accepted automatically.
+- First client in a channel is accepted automatically and becomes the channel admin.
 - Later clients require approval from any existing channel member.
-- Foreground `orbit join` clients can prompt directly when a new client asks to join.
+- Foreground `orbit join` clients can prompt directly when a new client asks to join (the prompt never blocks command delivery).
 - Peer command mode: `orbit exec <peer> -- <command>` waits for output and exit status.
 - Interactive shell mode: `orbit sh <peer>` opens a live shell on the target client.
 - File transfer mode: `orbit put` and `orbit get`, with a default `1 MiB` limit.
 - HTTP/SSE transport through the host, with no direct client-to-client networking.
-- Automatic empty-channel cleanup on the host.
+- Fail-fast everywhere: unclaimed work times out (`unclaimed`, exit 125), bad binaries fail immediately instead of hanging, and clients exit non-zero after repeated stream failures so a supervisor can take over.
+- Built-in supervision and diagnosis: `orbit join --daemon`, `orbit status` (local), `orbit doctor <peer>` (remote).
+- Member management: `orbit members`, `orbit leave`, `orbit remove <alias>`, `orbit transfer-admin <alias>`.
+- Automatic empty-channel cleanup on the host (default TTL: 7 days).
 
 ## Quick Start
 
@@ -45,7 +48,7 @@ uv run orbit --help
 Install the current GitHub release wheel as a tool:
 
 ```bash
-uv tool install https://github.com/mvp-ai-lab/mvp-orbit/releases/download/v0.6.0/mvp_orbit-0.6.0-py3-none-any.whl
+uv tool install https://github.com/mvp-ai-lab/mvp-orbit/releases/download/v0.7.0/mvp_orbit-0.7.0-py3-none-any.whl
 ```
 
 ### 2. Start the Host
@@ -170,6 +173,12 @@ orbit exec <peer> -- <command>
 orbit sh <peer>
 orbit put <peer> <local> <remote>
 orbit get <peer> <remote> <local>
+orbit status                   # local client health, no token needed
+orbit doctor <peer>            # remote diagnosis with a probe command
+orbit members                  # list members, roles, liveness
+orbit leave                    # leave the channel, revoke own credentials
+orbit remove <alias>           # admin: evict a member, revoke its credentials
+orbit transfer-admin <alias>   # admin: hand over the admin role
 ```
 
 Useful `join` options:
@@ -177,7 +186,20 @@ Useful `join` options:
 ```bash
 orbit join --no-start   # save config without starting the client loop
 orbit join --no-wait    # submit a join request and exit immediately
+orbit join --daemon     # run the client loop as a supervised background daemon
+                        # (auto-restart with backoff, pidfile + log under
+                        #  ~/.local/state/mvp-orbit/)
 ```
+
+Useful `exec` options (accepted before or after the peer name):
+
+```bash
+orbit exec client-b --timeout-sec 60 -- long-task     # kill the command after 60s
+orbit exec client-b --claim-timeout 10 -- quick-check  # fail fast if the peer is offline
+orbit exec client-b --shell 'echo hi | wc -c'          # run through /bin/sh -lc
+```
+
+Exit codes: the remote command's own exit code, `124` for a command timeout, `125` when no peer claimed the command in time, `130` when canceled, and `3` when the client loop gives up after repeated stream failures.
 
 Commands run inside the target client's workspace. `--working-dir` must stay inside that workspace. Relative remote file paths are resolved under the target client's workspace; absolute remote paths are allowed and should be used carefully.
 
@@ -185,12 +207,20 @@ Commands run inside the target client's workspace. `--working-dir` must stay ins
 
 Channel membership is the trust boundary.
 
-- The first client creates the channel and receives a member token.
+- The first client creates the channel, receives a member token, and becomes the channel **admin**.
 - Later clients cannot join until an existing member approves the join request.
-- A member token grants access to that channel until it expires.
+- A member token grants access to that channel until it expires or is revoked.
 - Any approved member can execute commands on any other connected member.
+- Only admins can `remove` members or change roles; anyone can `leave`. Removing a member (or leaving) revokes that alias's tokens immediately. The last admin must `transfer-admin` before leaving; when the last member leaves, the channel is deleted.
 
 This is not a sandbox. Only approve clients and run commands in channels where every member is trusted.
+
+## Reliability Behavior
+
+- The client exits non-zero (code 3) after `ORBIT_MAX_STREAM_FAILURES` consecutive stream failures (default 10, `0` = retry forever) with exponential backoff in between — a supervisor (`orbit join --daemon`, systemd, a watchdog script) then restarts it with a fresh environment.
+- Heartbeats report event-stream health separately: `orbit peers` / `orbit members` show `stream_connected`, so a machine whose process is alive but deaf is visible instead of silently queueing work.
+- The host fails QUEUED work nobody claims within `ORBIT_CLAIM_TIMEOUT_SEC` (default 30s, per-command override with `orbit exec --claim-timeout N`) as `unclaimed`, so callers get a fast, diagnosable failure instead of an infinite hang.
+- `orbit status` answers "is my own client healthy?" locally; `orbit doctor <peer>` distinguishes process-dead / deaf-client / healthy for a remote machine.
 
 ## Configuration
 
@@ -206,8 +236,10 @@ Useful runtime environment variables:
 
 ```bash
 ORBIT_CONFIG=~/.config/mvp-orbit/config.toml
-ORBIT_WORKSPACE_ROOT=/path/to/workspace
+ORBIT_WORKSPACE_ROOT=/path/to/workspace   # pinned automatically at first join
 ORBIT_HEARTBEAT_SEC=15
+ORBIT_MAX_STREAM_FAILURES=10  # 0 = retry forever
+ORBIT_STATE_DIR=~/.local/state/mvp-orbit  # status file, daemon log + pidfile
 ORBIT_LOG_LEVEL=INFO      # DEBUG, INFO, WARNING, ERROR
 NO_COLOR=1               # disable ANSI colors
 ```
@@ -219,6 +251,8 @@ ORBIT_HUB_HOST=127.0.0.1
 ORBIT_HUB_PORT=8080
 ORBIT_HUB_DB=./.orbit-hub/hub.sqlite3
 ORBIT_OBJECT_ROOT=./.orbit-hub/objects
+ORBIT_CLAIM_TIMEOUT_SEC=30        # fail queued work nobody claims (0 = disable)
+ORBIT_GRACEFUL_SHUTDOWN_SEC=10    # bound shutdown draining of open SSE streams
 ORBIT_ACCESS_LOG=0        # set to 1 to enable uvicorn HTTP access logs
 ```
 
@@ -231,7 +265,7 @@ Defaults:
 ```bash
 ORBIT_CHANNEL_CLEANUP_ENABLED=1
 ORBIT_CLIENT_OFFLINE_SEC=90
-ORBIT_CHANNEL_EMPTY_TTL_SEC=3600
+ORBIT_CHANNEL_EMPTY_TTL_SEC=604800   # 7 days
 ORBIT_CHANNEL_CLEANUP_INTERVAL_SEC=60
 ```
 

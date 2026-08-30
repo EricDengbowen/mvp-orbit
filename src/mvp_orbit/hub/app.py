@@ -30,6 +30,7 @@ from mvp_orbit.core.models import (
     JoinRequest,
     JoinRequestStatus,
     JoinResponse,
+    RoleChangeRequest,
     ShellInputRequest,
     ShellResizeRequest,
     ShellSessionCreateRequest,
@@ -255,6 +256,52 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
     @app.get("/api/peers", response_model=list[ClientRecord])
     def list_peers(member: AuthenticatedMember = Depends(require_member)) -> list[ClientRecord]:
         return store.list_clients(member.channel_id)
+
+    def _require_alias(member: AuthenticatedMember) -> str:
+        if not member.alias:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="this token predates member management — run `orbit join --no-start` to re-enroll, then retry",
+            )
+        return member.alias
+
+    @app.get("/api/members")
+    def list_members(member: AuthenticatedMember = Depends(require_member)) -> list[dict]:
+        return store.list_members(member.channel_id)
+
+    @app.post("/api/members/leave")
+    def leave_channel(member: AuthenticatedMember = Depends(require_member)) -> dict:
+        alias = _require_alias(member)
+        try:
+            return store.leave_channel(member.channel_id, alias)
+        except MembershipError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @app.post("/api/members/{alias}/remove")
+    def remove_member(alias: str, member: AuthenticatedMember = Depends(require_member)) -> dict:
+        actor = _require_alias(member)
+        try:
+            return store.remove_member(member.channel_id, actor, alias)
+        except MembershipError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @app.post("/api/members/{alias}/role")
+    def set_member_role(alias: str, request: RoleChangeRequest, member: AuthenticatedMember = Depends(require_member)) -> dict:
+        actor = _require_alias(member)
+        try:
+            return store.set_member_role(member.channel_id, actor, alias, request.role)
+        except MembershipError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     @app.get("/api/clients/{client_id}/stream")
     async def client_stream(client_id: str, request: Request, member: AuthenticatedMember = Depends(require_member)) -> StreamingResponse:

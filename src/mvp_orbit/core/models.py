@@ -99,6 +99,12 @@ class JoinApprovalRecord(BaseModel):
     rejected_by: str | None = None
 
 
+class RoleChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str = Field(pattern="^(admin|member)$")
+
+
 class CommandCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

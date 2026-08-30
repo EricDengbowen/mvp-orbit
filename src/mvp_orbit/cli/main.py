@@ -843,6 +843,71 @@ def _attach_shell(hub_url: str, member_token: str, session_id: str) -> None:
         raise stream_error[0]
 
 
+def _post_json(hub_url: str, member_token: str, path: str, payload: dict | None = None) -> dict:
+    with httpx.Client(timeout=20) as client:
+        response = client.post(f"{hub_url}{path}", headers=_headers(member_token), json=payload)
+        if response.status_code in {403, 404, 409}:
+            try:
+                detail = response.json().get("detail")
+            except Exception:
+                detail = response.text
+            raise RuntimeError(str(detail))
+        _raise_with_guidance(response)
+        return response.json()
+
+
+def _confirm_or_yes(args: argparse.Namespace, question: str) -> bool:
+    if getattr(args, "yes", False):
+        return True
+    if not sys.stdin.isatty():
+        raise RuntimeError("refusing a destructive action without a terminal — pass --yes to confirm")
+    answer = input(f"{question} [y/N]: ").strip().lower()
+    return answer in {"y", "yes"}
+
+
+def cmd_members(args: argparse.Namespace) -> int:
+    member_token = _require_live_member_token(args.member_token, args.token_expires_at)
+    members = _fetch_json(args.hub_url, member_token, "/api/members")
+    print(json.dumps(members, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_leave(args: argparse.Namespace) -> int:
+    member_token = _require_live_member_token(args.member_token, args.token_expires_at)
+    if not _confirm_or_yes(args, "Leave this channel? Your credentials on this machine stop working immediately"):
+        return 1
+    result = _post_json(args.hub_url, member_token, "/api/members/leave")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    # The token is revoked server-side; drop it locally too.
+    config_path, config = load_config(args.config)
+    config.auth.member_token = None
+    config.auth.expires_at = None
+    save_config(config, config_path)
+    return 0
+
+
+def cmd_remove_member(args: argparse.Namespace) -> int:
+    member_token = _require_live_member_token(args.member_token, args.token_expires_at)
+    if not _confirm_or_yes(args, f"Remove {args.target!r} from the channel and revoke its credentials"):
+        return 1
+    result = _post_json(args.hub_url, member_token, f"/api/members/{args.target}/remove")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_transfer_admin(args: argparse.Namespace) -> int:
+    member_token = _require_live_member_token(args.member_token, args.token_expires_at)
+    promoted = _post_json(args.hub_url, member_token, f"/api/members/{args.target}/role", {"role": "admin"})
+    print(json.dumps(promoted, ensure_ascii=False, indent=2))
+    if not args.keep_admin:
+        _, config = load_config(args.config)
+        own_alias = config.client.id
+        if own_alias and own_alias != args.target:
+            demoted = _post_json(args.hub_url, member_token, f"/api/members/{own_alias}/role", {"role": "member"})
+            print(json.dumps(demoted, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_hub_serve(args: argparse.Namespace) -> int:
     from mvp_orbit.hub.app import main as hub_main
 
@@ -1045,7 +1110,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor}",
+        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor,members,leave,remove,transfer-admin}",
     )
 
     host = sub.add_parser("host", help="start the control host")
@@ -1075,6 +1140,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     supervise = sub.add_parser("daemon-supervise")  # internal: exec'd by `orbit join --daemon`
     supervise.set_defaults(func=cmd_daemon_supervise)
+
+    def _token_args(p) -> None:
+        p.add_argument("--hub-url", default=None)
+        p.add_argument("--member-token", default=os.getenv("ORBIT_MEMBER_TOKEN"))
+        p.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
+
+    members = sub.add_parser("members", help="list channel members with roles and liveness")
+    _token_args(members)
+    members.set_defaults(func=cmd_members)
+
+    leave = sub.add_parser("leave", help="leave the channel and revoke this machine's credentials")
+    _token_args(leave)
+    leave.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    leave.set_defaults(func=cmd_leave)
+
+    remove = sub.add_parser("remove", help="admin: remove a member and revoke its credentials: orbit remove <alias>")
+    _token_args(remove)
+    remove.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    remove.add_argument("target")
+    remove.set_defaults(func=cmd_remove_member)
+
+    transfer = sub.add_parser("transfer-admin", help="admin: promote <alias> to admin and step down: orbit transfer-admin <alias>")
+    _token_args(transfer)
+    transfer.add_argument("--keep-admin", action="store_true", help="promote the target but stay admin yourself")
+    transfer.add_argument("target")
+    transfer.set_defaults(func=cmd_transfer_admin)
 
     join_requests = sub.add_parser("join-requests", help="list pending join requests")
     join_requests.add_argument("--hub-url", default=None)
@@ -1153,7 +1244,7 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
     if args.command == "join":
         if getattr(args, "host", None) is None:
             args.host = config.hub.resolved_url()
-    if args.command in {"join-requests", "approve", "reject", "peers", "exec", "sh", "put", "get", "doctor"}:
+    if args.command in {"join-requests", "approve", "reject", "peers", "exec", "sh", "put", "get", "doctor", "members", "leave", "remove", "transfer-admin"}:
         _validate_required(parser, args, "hub_url", "member_token", "token_expires_at")
     if args.command == "exec":
         argv = list(args.command_argv or [])

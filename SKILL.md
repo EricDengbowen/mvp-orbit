@@ -83,27 +83,34 @@ The supported CLI commands are:
 
 ```text
 orbit host
-orbit join
+orbit join                      # --no-start / --no-wait / --daemon
 orbit join-requests
 orbit approve <REQUEST_ID>
 orbit reject <REQUEST_ID>
 orbit peers
-orbit exec <peer> -- <command>
+orbit exec <peer> -- <command>  # --timeout-sec / --claim-timeout / --shell
 orbit sh <peer>
 orbit put <peer> <local> <remote>
 orbit get <peer> <remote> <local>
+orbit status                    # local client health (no token)
+orbit doctor <peer>             # remote diagnosis via a probe command
+orbit members
+orbit leave
+orbit remove <alias>            # admin only
+orbit transfer-admin <alias>    # admin only
 ```
 
-Do not expand the public CLI unless the change directly supports one of the three peer operation modes: single command execution, interactive shell, or file transfer.
+Do not expand the public CLI unless the change directly supports one of the peer operation modes (command execution, interactive shell, file transfer), reliability/diagnosis (`status`, `doctor`, `--daemon`), or member management.
 
 ## Security Model
 
 Channel membership is the trust boundary.
 
-- The first client in a channel is accepted automatically.
+- The first client in a channel is accepted automatically and becomes the channel admin.
 - Later clients must be approved by an existing channel member.
-- Approved members receive a member token for that channel.
+- Approved members receive a member token for that channel (bound to their alias).
 - Any approved member can execute commands on any other approved, connected member in the same channel.
+- Only admins can remove members or change roles; removals revoke the target's tokens immediately. The sole admin must transfer the role before leaving; the channel is deleted when the last member leaves.
 
 This project is not a sandbox. Avoid implying untrusted code isolation. Changes that affect approval, token validation, workspace paths, shell execution, or file transfer limits need tests.
 
@@ -124,6 +131,19 @@ When changing behavior:
 4. Keep file transfers bounded by `--max-bytes` and default to 1 MiB.
 5. Preserve structured log format from `mvp_orbit.core.logging`.
 6. Update both `README.md` and `README.zh-CN.md` when user-facing behavior changes.
+
+## Reliability Invariants
+
+Preserve these behaviors when changing client or hub code:
+
+1. The SSE consume loop must never block on human input or a slow handler; anything interactive runs on a worker thread.
+2. Every claimed command/shell must reach a terminal status even when the runtime crashes or the binary cannot spawn — otherwise initiators hang forever.
+3. Command subprocesses get `stdin=/dev/null`; they must never inherit the client's terminal.
+4. Queued work nobody claims is failed by the hub reaper (`ORBIT_CLAIM_TIMEOUT_SEC`) as `unclaimed`; late completions must not resurrect terminal records.
+5. The client gives up (exit 3) after `ORBIT_MAX_STREAM_FAILURES` consecutive stream failures so a supervisor can restart it; joining, by contrast, retries transient errors with backoff.
+6. No infinite read timeouts anywhere: the hub keepalives streams every ~5s, and every consumer uses a finite read timeout with Last-Event-ID resume.
+7. Heartbeats carry `stream_connected` so liveness and usefulness stay distinguishable.
+8. Never detach with a bare `os.fork()` — fork+exec only (`orbit join --daemon` spawns `daemon-supervise`); bare forks segfault on macOS after CoreFoundation use.
 
 ## Validation Checklist
 

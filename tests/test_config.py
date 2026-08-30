@@ -58,7 +58,7 @@ def test_top_level_help_contains_only_new_commands(capsys):
     except SystemExit as exc:
         assert exc.code == 0
     output = capsys.readouterr().out
-    assert "{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor}" in output
+    assert "{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor,members,leave,remove,transfer-admin}" in output
     assert "cmd" not in output
     assert "package" not in output
     assert "connect" not in output
