@@ -612,7 +612,9 @@ def cmd_command_exec(args: argparse.Namespace) -> int:
         response = client.post(
             f"{args.hub_url}/api/commands",
             headers=_headers(member_token),
-            json=request.model_dump(mode="json"),
+            # exclude_none keeps requests compatible with hubs that predate
+            # optional fields like claim_timeout_sec (extra="forbid" models)
+            json=request.model_dump(mode="json", exclude_none=True),
         )
         _raise_with_guidance(response)
         payload = response.json()
@@ -954,6 +956,14 @@ def _daemonize_and_supervise(config_path: str) -> int:
         except (ValueError, ProcessLookupError, PermissionError):
             pid_path.unlink(missing_ok=True)
 
+    try:
+        # Atomically reserve the pidfile so two concurrent `join --daemon`
+        # invocations cannot both spawn a supervisor.
+        reservation = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(reservation, b"starting")
+        os.close(reservation)
+    except FileExistsError:
+        raise RuntimeError(f"daemon already starting or running (pidfile {pid_path} exists)") from None
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         process = subprocess.Popen(
@@ -964,6 +974,9 @@ def _daemonize_and_supervise(config_path: str) -> int:
             start_new_session=True,
             close_fds=True,
         )
+    except BaseException:
+        pid_path.unlink(missing_ok=True)
+        raise
     finally:
         os.close(log_fd)
     print(json.dumps({"daemon": True, "pid": process.pid, "log": str(log_path), "pidfile": str(pid_path)}, ensure_ascii=False, indent=2))
@@ -1073,7 +1086,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"[orbit doctor] probing with a {args.claim_timeout}s claim-timeout echo …")
     request = CommandCreateRequest(client_id=target, argv=["echo", "orbit-doctor-probe"], timeout_sec=60, claim_timeout_sec=args.claim_timeout)
     with httpx.Client(timeout=20) as client:
-        response = client.post(f"{args.hub_url}/api/commands", headers=_headers(member_token), json=request.model_dump(mode="json"))
+        response = client.post(f"{args.hub_url}/api/commands", headers=_headers(member_token), json=request.model_dump(mode="json", exclude_none=True))
         _raise_with_guidance(response)
         command_id = response.json()["command_id"]
     outcome: dict = {}

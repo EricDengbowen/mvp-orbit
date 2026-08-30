@@ -105,6 +105,7 @@ class ClientService:
         self._last_event_id = 0
         self._stream_connected = False
         self._stream_last_activity = 0.0
+        self._last_connection_good = False
         self._last_stream_error: str | None = None
         self._connected_at: float | None = None
         self._started_at = time.time()
@@ -140,9 +141,26 @@ class ClientService:
         try:
             while True:
                 self._stream_connected = False
+                self._last_connection_good = False
                 try:
                     self._consume_stream(client)
-                    consecutive_failures = 0
+                    if self._last_connection_good:
+                        # A stream that lived a while ended (e.g. hub restart):
+                        # reconnect promptly, streak forgiven.
+                        consecutive_failures = 0
+                        time.sleep(0.2)
+                    else:
+                        # Connections that die instantly must count as failures,
+                        # or a crash-looping hub would be hammered forever and
+                        # the give-up limit would never trigger.
+                        consecutive_failures += 1
+                        if self.max_stream_failures and consecutive_failures >= self.max_stream_failures:
+                            log_kv(logger, logging.ERROR, "client.stream_gave_up", client_id=self.client_id, failures=consecutive_failures)
+                            raise StreamFailureLimitError(
+                                f"giving up after {consecutive_failures} consecutive short-lived stream connections — "
+                                "exiting so a supervisor can restart with a fresh environment"
+                            )
+                        time.sleep(min(60.0, 2.0 ** min(consecutive_failures - 1, 6)))
                 except TokenExpiredError as exc:
                     log_kv(logger, logging.ERROR, "client.token_expired", client_id=self.client_id, action="run `orbit join --no-start` again")
                     raise RuntimeError("member token expired — run `orbit join --no-start` on this machine, then restart the client") from exc
@@ -158,7 +176,7 @@ class ClientService:
                     # what lets a supervisor take over when the network
                     # environment itself has gone bad (e.g. a proxy now
                     # answering 403), instead of retrying it forever.
-                    consecutive_failures = 1 if self._stream_connected else consecutive_failures + 1
+                    consecutive_failures = 1 if self._last_connection_good else consecutive_failures + 1
                     self._last_stream_error = f"{exc.__class__.__name__}: {exc}"
                     self._write_status_file()
                     log_kv(
@@ -227,18 +245,22 @@ class ClientService:
             self._last_stream_error = None
             self._write_status_file()
             log_kv(logger, logging.INFO, "client.stream_connected", client_id=self.client_id)
+            connected_monotonic = time.monotonic()
             block: list[str] = []
             for line in response.iter_lines():
                 if self._stream_unusable.is_set():
                     self._stream_unusable.clear()
                     raise StreamUnusableError("stream delivers keepalives but hub rejects posts")
                 self._stream_last_activity = time.monotonic()
+                if not self._last_connection_good and time.monotonic() - connected_monotonic >= 30.0:
+                    self._last_connection_good = True
                 if line == "":
                     event = self._parse_sse_block(block)
                     block = []
                     if event is None:
                         continue
                     self._last_event_id = max(self._last_event_id, event["event_id"])
+                    self._last_connection_good = True
                     self._dispatch_event(client, event["kind"], event["payload"])
                     continue
                 block.append(line)
@@ -389,19 +411,19 @@ class ClientService:
             # command left "running" hangs the initiator forever.
             log_kv(logger, logging.ERROR, "command.runtime_error", client_id=self.client_id, command_id=command_id, error=exc.__class__.__name__, detail=exc)
             outcome = CommandExecutionOutcome(status=CommandStatus.FAILED, exit_code=1, failure_code=f"runtime_error:{exc.__class__.__name__}")
-        self._post_client_events(
+        self._post_terminal_event(
             client,
-            [
-                ClientEvent(
-                    kind="command.exit",
-                    payload={
-                        "command_id": command_id,
-                        "status": outcome.status.value,
-                        "exit_code": outcome.exit_code,
-                        "failure_code": outcome.failure_code,
-                    },
-                )
-            ],
+            ClientEvent(
+                kind="command.exit",
+                payload={
+                    "command_id": command_id,
+                    "status": outcome.status.value,
+                    "exit_code": outcome.exit_code,
+                    "failure_code": outcome.failure_code,
+                },
+            ),
+            what="command",
+            key=command_id,
         )
         self._command_cancels.pop(command_id, None)
 
@@ -430,19 +452,19 @@ class ClientService:
             log_kv(logger, logging.ERROR, "shell.runtime_error", client_id=self.client_id, session_id=session_id, error=exc.__class__.__name__, detail=exc)
             outcome = ShellExecutionOutcome(status=ShellSessionStatus.FAILED, exit_code=1, failure_code=f"runtime_error:{exc.__class__.__name__}")
         final_kind = "shell.closed" if outcome.status.value == "closed" else "shell.exit"
-        self._post_client_events(
+        self._post_terminal_event(
             client,
-            [
-                ClientEvent(
-                    kind=final_kind,
-                    payload={
-                        "session_id": session_id,
-                        "status": outcome.status.value,
-                        "exit_code": outcome.exit_code,
-                        "failure_code": outcome.failure_code,
-                    },
-                )
-            ],
+            ClientEvent(
+                kind=final_kind,
+                payload={
+                    "session_id": session_id,
+                    "status": outcome.status.value,
+                    "exit_code": outcome.exit_code,
+                    "failure_code": outcome.failure_code,
+                },
+            ),
+            what="shell",
+            key=session_id,
         )
         self._shell_controls.pop(session_id, None)
 
@@ -486,6 +508,20 @@ class ClientService:
             raise ValueError(session_id)
         self._raise_for_status(response)
         return ShellSessionLease.model_validate(response.json())
+
+    def _post_terminal_event(self, client: httpx.Client, event: ClientEvent, *, what: str, key: str) -> None:
+        # Terminal events are what unblock initiators; a hub blip at exactly
+        # this moment must not lose them, so retry for a while. If the client
+        # itself dies the hub's client-lost reaper takes over.
+        for attempt, delay in enumerate((0.0, 2.0, 4.0, 8.0, 15.0, 15.0, 15.0, 30.0), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                self._post_client_events(client, [event])
+                return
+            except Exception as exc:
+                log_kv(logger, logging.WARNING, f"{what}.exit_post_failed", client_id=self.client_id, key=key, error=exc.__class__.__name__, attempt=attempt)
+        log_kv(logger, logging.ERROR, f"{what}.exit_post_lost", client_id=self.client_id, key=key)
 
     def _post_client_events(self, client: httpx.Client, events: list[ClientEvent]) -> None:
         if not events:

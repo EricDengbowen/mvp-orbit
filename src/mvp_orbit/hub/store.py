@@ -297,21 +297,12 @@ class HubStore:
                     expires_at=token.expires_at,
                 )
 
-            existing = self._conn.execute(
-                "SELECT 1 FROM channel_members WHERE channel_id = ? AND alias = ?",
-                (channel_id, alias),
-            ).fetchone()
-            if existing is not None:
-                token = self._issue_token_locked(channel_id, alias=alias)
-                log_kv(logger, logging.INFO, "join.rejoined", channel_id=channel_id, alias=alias)
-                return JoinResponse(
-                    status=JoinRequestStatus.APPROVED,
-                    alias=alias,
-                    channel_id=channel_id,
-                    member_token=token.member_token,
-                    expires_at=token.expires_at,
-                )
-
+            # NOTE deliberately no unauthenticated fast path for an existing
+            # alias: /api/join is anonymous, so handing out a token because the
+            # caller *claims* a member's alias would let anyone who knows a
+            # channel name + alias mint that member's credentials (an admin's,
+            # since roles exist). Re-enrollment goes through approval like any
+            # other join; membership and role are preserved on approval.
             now = utc_now()
             self._conn.execute(
                 """
@@ -965,9 +956,13 @@ class HubStore:
 
     def _evict_member_locked(self, channel_id: str, alias: str) -> None:
         # Revoking the tokens takes effect on the member's very next request.
+        # Legacy tokens (minted before alias binding) cannot be attributed to a
+        # member, so evicting anyone also revokes all of them — otherwise the
+        # evicted member could keep using a pre-v0.7 token forever. Remaining
+        # members holding such tokens just re-enroll once.
         now = utc_now().isoformat()
         self._conn.execute(
-            "UPDATE member_tokens SET revoked_at = ? WHERE channel_id = ? AND alias = ? AND revoked_at IS NULL",
+            "UPDATE member_tokens SET revoked_at = ? WHERE channel_id = ? AND (alias = ? OR alias IS NULL) AND revoked_at IS NULL",
             (now, channel_id, alias),
         )
         client_ids = [
@@ -1028,12 +1023,58 @@ class HubStore:
         self._notify_update()
         return {"status": "role_changed", "alias": target_alias, "channel_id": channel_id, "role": role}
 
-    def reap_unclaimed_work(self, *, default_claim_timeout_sec: float) -> int:
+    def reap_unclaimed_work(self, *, default_claim_timeout_sec: float, client_lost_after_sec: float = 90.0) -> int:
         """Fail QUEUED work nobody claimed in time, so initiators get a terminal
-        event instead of hanging forever on a dead or absent peer."""
+        event instead of hanging forever on a dead or absent peer. Also fail
+        RUNNING work whose executing client stopped heartbeating (crashed or
+        was removed mid-command) — the client can no longer report an exit."""
         now = utc_now()
         reaped = 0
         with self._lock, self._conn:
+            if client_lost_after_sec > 0:
+                lost_cutoff = (now - timedelta(seconds=client_lost_after_sec)).isoformat()
+                lost_rows = self._conn.execute(
+                    """
+                    SELECT cmd.* FROM commands cmd
+                    LEFT JOIN clients c ON c.client_id = cmd.client_id AND c.channel_id = cmd.channel_id
+                    WHERE cmd.status = ? AND (c.client_id IS NULL OR c.last_seen_at IS NULL OR c.last_seen_at < ?)
+                    """,
+                    (CommandStatus.RUNNING.value, lost_cutoff),
+                ).fetchall()
+                for row in lost_rows:
+                    record = self._row_to_command(dict(row))
+                    self._conn.execute(
+                        "UPDATE commands SET status = ?, finished_at = ?, failure_code = ? WHERE command_id = ? AND status = ?",
+                        (CommandStatus.FAILED.value, now.isoformat(), "client_lost", record.command_id, CommandStatus.RUNNING.value),
+                    )
+                    self._append_command_event_locked(
+                        record.command_id,
+                        "command.exit",
+                        {"command_id": record.command_id, "status": CommandStatus.FAILED.value, "exit_code": None, "failure_code": "client_lost"},
+                    )
+                    log_kv(logger, logging.WARNING, "command.client_lost", command_id=record.command_id, client_id=record.client_id)
+                    reaped += 1
+                lost_shells = self._conn.execute(
+                    """
+                    SELECT s.* FROM shell_sessions s
+                    LEFT JOIN clients c ON c.client_id = s.client_id AND c.channel_id = s.channel_id
+                    WHERE s.status = ? AND (c.client_id IS NULL OR c.last_seen_at IS NULL OR c.last_seen_at < ?)
+                    """,
+                    (ShellSessionStatus.RUNNING.value, lost_cutoff),
+                ).fetchall()
+                for row in lost_shells:
+                    record = self._row_to_shell(dict(row))
+                    self._conn.execute(
+                        "UPDATE shell_sessions SET status = ?, finished_at = ?, failure_code = ? WHERE session_id = ? AND status = ?",
+                        (ShellSessionStatus.FAILED.value, now.isoformat(), "client_lost", record.session_id, ShellSessionStatus.RUNNING.value),
+                    )
+                    self._append_shell_event_locked(
+                        record.session_id,
+                        "shell.exit",
+                        {"session_id": record.session_id, "status": ShellSessionStatus.FAILED.value, "exit_code": None, "failure_code": "client_lost"},
+                    )
+                    log_kv(logger, logging.WARNING, "shell.client_lost", session_id=record.session_id, client_id=record.client_id)
+                    reaped += 1
             for row in self._conn.execute("SELECT * FROM commands WHERE status = ?", (CommandStatus.QUEUED.value,)).fetchall():
                 record = self._row_to_command(dict(row))
                 timeout = record.claim_timeout_sec if record.claim_timeout_sec is not None else default_claim_timeout_sec

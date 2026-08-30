@@ -159,7 +159,11 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
         interval = max(1.0, min(claim_timeout_sec / 2.0, 10.0))
         while True:
             await asyncio.sleep(interval)
-            await asyncio.to_thread(store.reap_unclaimed_work, default_claim_timeout_sec=claim_timeout_sec)
+            await asyncio.to_thread(
+                store.reap_unclaimed_work,
+                default_claim_timeout_sec=claim_timeout_sec,
+                client_lost_after_sec=client_offline_sec,
+            )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
