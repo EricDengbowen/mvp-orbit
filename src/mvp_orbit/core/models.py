@@ -52,6 +52,10 @@ class ClientRecord(BaseModel):
     channel_id: str = Field(min_length=1)
     created_at: datetime
     last_seen_at: datetime | None = None
+    # None: client predates stream-health reporting. True/False: whether its
+    # event stream was healthy at the last heartbeat (a fresh last_seen_at with
+    # stream_connected=false means "process alive but deaf").
+    stream_connected: bool | None = None
 
 
 class TokenResponse(BaseModel):

@@ -9,6 +9,7 @@ import re
 import select
 import signal
 import shutil
+import subprocess
 import sys
 import termios
 import textwrap
@@ -176,6 +177,18 @@ def _headers(member_token: str | None) -> dict[str, str]:
     if member_token:
         headers["Authorization"] = f"Bearer {member_token}"
     return headers
+
+
+REENROLL_HINT = (
+    "hub rejected the member token (expired, revoked, or the channel was pruned) — "
+    "run `orbit join --no-start` on this machine to re-enroll, then retry"
+)
+
+
+def _raise_with_guidance(response: httpx.Response) -> None:
+    if response.status_code == 401:
+        raise RuntimeError(REENROLL_HINT)
+    response.raise_for_status()
 
 
 def _set_if_missing(args: argparse.Namespace, name: str, value) -> None:
@@ -379,6 +392,10 @@ def cmd_join(args: argparse.Namespace) -> int:
     config.client.id = alias
     config.auth.member_token = payload["member_token"]
     config.auth.expires_at = _parse_datetime(payload["expires_at"])
+    if not config.client.workspace_root:
+        # Pin the workspace at join time; otherwise put/get land wherever the
+        # client process happened to be started from on any given day.
+        config.client.workspace_root = str(Path.cwd())
     saved_path = save_config(config, config_path)
     print(
         json.dumps(
@@ -389,6 +406,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                 "host": host,
                 "channel_id": payload.get("channel_id"),
                 "token_expires_at": payload["expires_at"],
+                "workspace_root": config.client.workspace_root,
                 "started": not args.no_start,
             },
             ensure_ascii=False,
@@ -397,6 +415,8 @@ def cmd_join(args: argparse.Namespace) -> int:
     )
     if args.no_start:
         return 0
+    if getattr(args, "daemon", False):
+        return _daemonize_and_supervise(config_path)
     return _run_client_loop(config)
 
 
@@ -405,7 +425,7 @@ def cmd_join_requests(args: argparse.Namespace) -> int:
     params = {"status": args.status} if args.status else None
     with httpx.Client(timeout=20) as client:
         response = client.get(f"{args.hub_url}/api/join-requests", headers=_headers(member_token), params=params)
-        response.raise_for_status()
+        _raise_with_guidance(response)
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
@@ -414,7 +434,7 @@ def cmd_approve_join(args: argparse.Namespace) -> int:
     member_token = _require_live_member_token(args.member_token, args.token_expires_at)
     with httpx.Client(timeout=20) as client:
         response = client.post(f"{args.hub_url}/api/join-requests/{args.request_id}/approve", headers=_headers(member_token))
-        response.raise_for_status()
+        _raise_with_guidance(response)
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
@@ -423,7 +443,7 @@ def cmd_reject_join(args: argparse.Namespace) -> int:
     member_token = _require_live_member_token(args.member_token, args.token_expires_at)
     with httpx.Client(timeout=20) as client:
         response = client.post(f"{args.hub_url}/api/join-requests/{args.request_id}/reject", headers=_headers(member_token))
-        response.raise_for_status()
+        _raise_with_guidance(response)
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
@@ -432,7 +452,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
     member_token = _require_live_member_token(args.member_token, args.token_expires_at)
     with httpx.Client(timeout=20) as client:
         response = client.get(f"{args.hub_url}/api/peers", headers=_headers(member_token))
-        response.raise_for_status()
+        _raise_with_guidance(response)
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
@@ -522,7 +542,7 @@ def cmd_file_push(args: argparse.Namespace) -> int:
             headers=_headers(member_token),
             json=request.model_dump(mode="json"),
         )
-        response.raise_for_status()
+        _raise_with_guidance(response)
         transfer_id = response.json()["transfer_id"]
     result = _follow_file_transfer(args.hub_url, member_token, transfer_id)
     if result.get("status") != FileTransferStatus.SUCCEEDED.value:
@@ -541,7 +561,7 @@ def cmd_file_pull(args: argparse.Namespace) -> int:
             headers=_headers(member_token),
             json=request.model_dump(mode="json"),
         )
-        response.raise_for_status()
+        _raise_with_guidance(response)
         transfer_id = response.json()["transfer_id"]
     result = _follow_file_transfer(args.hub_url, member_token, transfer_id)
     if result.get("status") != FileTransferStatus.SUCCEEDED.value:
@@ -594,7 +614,7 @@ def cmd_command_exec(args: argparse.Namespace) -> int:
             headers=_headers(member_token),
             json=request.model_dump(mode="json"),
         )
-        response.raise_for_status()
+        _raise_with_guidance(response)
         payload = response.json()
         command_id = payload["command_id"]
         if args.detach:
@@ -655,6 +675,8 @@ def _follow_stream(hub_url: str, member_token: str, path: str, on_event) -> dict
                 headers["Last-Event-ID"] = last_event_id
             try:
                 with client.stream("GET", f"{hub_url}{path}", headers=headers) as response:
+                    if response.status_code == 401:
+                        raise RuntimeError(REENROLL_HINT)
                     response.raise_for_status()
                     failures = 0
                     for event in _iter_sse_events(response):
@@ -677,7 +699,7 @@ def _follow_stream(hub_url: str, member_token: str, path: str, on_event) -> dict
 def _fetch_json(hub_url: str, member_token: str, path: str) -> dict:
     with httpx.Client(timeout=20) as client:
         response = client.get(f"{hub_url}{path}", headers=_headers(member_token))
-        response.raise_for_status()
+        _raise_with_guidance(response)
         return response.json()
 
 
@@ -730,7 +752,7 @@ def cmd_shell_start(args: argparse.Namespace) -> int:
             headers=_headers(member_token),
             json=request.model_dump(mode="json"),
         )
-        response.raise_for_status()
+        _raise_with_guidance(response)
         payload = response.json()
     if args.detach or not sys.stdin.isatty():
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -748,7 +770,7 @@ def _post_shell_resize(hub_url: str, member_token: str, session_id: str) -> None
             headers=_headers(member_token),
             json=ShellResizeRequest(rows=size.lines, cols=size.columns).model_dump(mode="json"),
         )
-        response.raise_for_status()
+        _raise_with_guidance(response)
 
 
 def _attach_shell(hub_url: str, member_token: str, session_id: str) -> None:
@@ -809,7 +831,7 @@ def _attach_shell(hub_url: str, member_token: str, session_id: str) -> None:
                     headers=_headers(member_token),
                     json={"data": data.decode("utf-8", errors="replace")},
                 )
-                response.raise_for_status()
+                _raise_with_guidance(response)
     except KeyboardInterrupt:
         pass
     finally:
@@ -829,6 +851,190 @@ def cmd_hub_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _force_runtime_env(config: OrbitConfig) -> None:
+    values = {
+        "ORBIT_HUB_URL": config.hub.resolved_url(),
+        "ORBIT_MEMBER_TOKEN": config.auth.member_token,
+        "ORBIT_TOKEN_EXPIRES_AT": config.auth.expires_at.isoformat() if config.auth.expires_at else None,
+        "ORBIT_CLIENT_ID": config.client.id,
+        "ORBIT_WORKSPACE_ROOT": config.client.workspace_root,
+    }
+    for name, value in values.items():
+        if value is not None:
+            os.environ[name] = str(value)
+
+
+def _daemon_paths(config_path: str):
+    from mvp_orbit.client.service import state_dir
+
+    _, config = load_config(config_path)
+    alias = config.client.id or "client"
+    root = state_dir()
+    if root is None:
+        raise RuntimeError("cannot determine a state directory for daemon logs (set ORBIT_STATE_DIR)")
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"daemon-{alias}.log", root / f"daemon-{alias}.pid"
+
+
+def _daemonize_and_supervise(config_path: str) -> int:
+    # Detach via fork+exec (subprocess), NOT a bare os.fork(): forking a Python
+    # process that has touched CoreFoundation (httpx's system-proxy lookup
+    # does) segfaults the child on macOS — "crashed on child side of fork".
+    log_path, pid_path = _daemon_paths(config_path)
+    if pid_path.exists():
+        try:
+            existing = int(pid_path.read_text().strip())
+            os.kill(existing, 0)
+            raise RuntimeError(f"daemon already running (pid {existing}); stop it with `kill {existing}` first")
+        except (ValueError, ProcessLookupError, PermissionError):
+            pid_path.unlink(missing_ok=True)
+
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "mvp_orbit.cli.main", "--config", str(config_path), "daemon-supervise"],
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=log_fd,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        os.close(log_fd)
+    print(json.dumps({"daemon": True, "pid": process.pid, "log": str(log_path), "pidfile": str(pid_path)}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_daemon_supervise(args: argparse.Namespace) -> int:
+    # The detached supervisor process: restart the client loop with backoff
+    # until the token expires or someone stops us.
+    config_path = args.config
+    _, pid_path = _daemon_paths(config_path)
+    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    def on_term(signum, frame):
+        print(f"[orbit-daemon] received signal {signum}, exiting", flush=True)
+        pid_path.unlink(missing_ok=True)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    delay = 10.0
+    try:
+        while True:
+            _, config = load_config(config_path)
+            if config.auth.expires_at is None or config.auth.expires_at <= utc_now():
+                print("[orbit-daemon] member token expired — run `orbit join` again, then restart the daemon", flush=True)
+                break
+            _force_runtime_env(config)
+            started = time.monotonic()
+            try:
+                _run_client_loop(config)
+                code: int | str | None = 0
+            except SystemExit as exc:
+                code = exc.code
+            except Exception as exc:  # noqa: BLE001 — the supervisor must survive anything
+                print(f"[orbit-daemon] client crashed: {exc.__class__.__name__}: {exc}", flush=True)
+                code = 1
+            # A loop that ran for a while earns a fresh backoff.
+            delay = 10.0 if time.monotonic() - started > 120 else min(60.0, delay * 2)
+            print(f"[orbit-daemon] client exited (code={code}), restarting in {delay:.0f}s", flush=True)
+            time.sleep(delay)
+    finally:
+        pid_path.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    from mvp_orbit.client.service import status_file_path
+
+    _, config = load_config(args.config)
+    client_id = getattr(args, "client_id", None) or config.client.id
+    if not client_id:
+        raise RuntimeError("no client id configured — run `orbit join` first")
+    path = status_file_path(client_id)
+    if path is None or not path.exists():
+        print(f"[orbit] no status file for {client_id!r} — the client loop has never run on this machine (or ORBIT_STATE_DIR differs)")
+        return 1
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    pid = payload.get("pid")
+    alive = False
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except (ProcessLookupError, PermissionError):
+            alive = False
+    age = time.time() - float(payload.get("updated_at") or 0)
+    connected = bool(payload.get("stream_connected"))
+    stream_line = "connected" if connected else "DISCONNECTED"
+    if not alive:
+        stream_line = f"unknown (last written while running: {stream_line})"
+    lines = [
+        f"client:    {payload.get('client_id')}",
+        f"hub:       {payload.get('hub_url')}",
+        f"process:   {'running' if alive else 'NOT RUNNING'} (pid {pid}, status written {age:.0f}s ago)",
+        f"stream:    {stream_line}",
+        f"workspace: {payload.get('workspace')}",
+    ]
+    if payload.get("last_stream_error"):
+        lines.append(f"last error: {payload['last_stream_error']}")
+    if config.auth.expires_at is not None:
+        lines.append(f"token:     expires {config.auth.expires_at.isoformat()}")
+    print("\n".join(lines))
+    if not alive:
+        print("\n[orbit] the client process is not running — start it with `orbit join --daemon` (or your supervisor)")
+        return 1
+    if not connected or age > 60:
+        print("\n[orbit] the process is alive but the event stream is not healthy — check the last error above; if it persists, restart the client")
+        return 2
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    member_token = _require_live_member_token(args.member_token, args.token_expires_at)
+    target = args.target
+    print(f"[orbit doctor] token: valid (expires {args.token_expires_at})")
+
+    peers = _fetch_json(args.hub_url, member_token, "/api/peers")
+    record = next((item for item in peers if item.get("client_id") == target), None)
+    if record is None:
+        print(f"[orbit doctor] peer {target!r}: UNKNOWN to the hub — it never connected in this channel (check the alias, or start its client loop)")
+        return 2
+    last_seen = _parse_datetime(record.get("last_seen_at"))
+    age = (utc_now() - last_seen).total_seconds() if last_seen else None
+    stream_connected = record.get("stream_connected")
+    print(f"[orbit doctor] peer {target!r}: last_seen {'never' if age is None else f'{age:.0f}s ago'}, stream_connected={stream_connected}")
+
+    print(f"[orbit doctor] probing with a {args.claim_timeout}s claim-timeout echo …")
+    request = CommandCreateRequest(client_id=target, argv=["echo", "orbit-doctor-probe"], timeout_sec=60, claim_timeout_sec=args.claim_timeout)
+    with httpx.Client(timeout=20) as client:
+        response = client.post(f"{args.hub_url}/api/commands", headers=_headers(member_token), json=request.model_dump(mode="json"))
+        _raise_with_guidance(response)
+        command_id = response.json()["command_id"]
+    outcome: dict = {}
+
+    def on_event(event: dict) -> dict | None:
+        return event["payload"] if event["event"] == "command.exit" else None
+
+    outcome = _follow_stream(args.hub_url, member_token, f"/api/commands/{command_id}/stream", on_event) or {}
+
+    status = outcome.get("status")
+    failure = outcome.get("failure_code")
+    heartbeat_fresh = age is not None and age < 45
+    if status == "succeeded":
+        print(f"[orbit doctor] VERDICT: healthy — {target} claimed and ran the probe")
+        return 0
+    if failure == "unclaimed" and not heartbeat_fresh:
+        print(f"[orbit doctor] VERDICT: process dead — no heartbeat and no claim; restart the client loop on {target}")
+    elif failure == "unclaimed" and stream_connected is False:
+        print(f"[orbit doctor] VERDICT: deaf client — heartbeats arrive but the event stream is down on {target}; restart its client loop")
+    elif failure == "unclaimed":
+        print(f"[orbit doctor] VERDICT: peer looks alive but did not claim in {args.claim_timeout}s — its event loop may be stuck; restart its client loop")
+    else:
+        print(f"[orbit doctor] VERDICT: probe finished with status={status} failure={failure} — see output above")
+    return 1
+
+
 def _load_json(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -839,7 +1045,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get}",
+        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor}",
     )
 
     host = sub.add_parser("host", help="start the control host")
@@ -852,7 +1058,23 @@ def build_parser() -> argparse.ArgumentParser:
     join.add_argument("--wait-sec", type=int, default=600)
     join.add_argument("--no-wait", action="store_true")
     join.add_argument("--no-start", action="store_true", help="join and save config without starting the client loop")
+    join.add_argument("--daemon", action="store_true", help="run the client loop as a supervised background daemon (auto-restart, log under ~/.local/state/mvp-orbit)")
     join.set_defaults(func=cmd_join)
+
+    status = sub.add_parser("status", help="show this machine's client state (local, no token needed)")
+    status.add_argument("--client-id", default=None)
+    status.set_defaults(func=cmd_status)
+
+    doctor = sub.add_parser("doctor", help="diagnose a peer: orbit doctor <peer>")
+    doctor.add_argument("--hub-url", default=None)
+    doctor.add_argument("--member-token", default=os.getenv("ORBIT_MEMBER_TOKEN"))
+    doctor.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
+    doctor.add_argument("--claim-timeout", type=int, default=10)
+    doctor.add_argument("target")
+    doctor.set_defaults(func=cmd_doctor)
+
+    supervise = sub.add_parser("daemon-supervise")  # internal: exec'd by `orbit join --daemon`
+    supervise.set_defaults(func=cmd_daemon_supervise)
 
     join_requests = sub.add_parser("join-requests", help="list pending join requests")
     join_requests.add_argument("--hub-url", default=None)
@@ -931,7 +1153,7 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
     if args.command == "join":
         if getattr(args, "host", None) is None:
             args.host = config.hub.resolved_url()
-    if args.command in {"join-requests", "approve", "reject", "peers", "exec", "sh", "put", "get"}:
+    if args.command in {"join-requests", "approve", "reject", "peers", "exec", "sh", "put", "get", "doctor"}:
         _validate_required(parser, args, "hub_url", "member_token", "token_expires_at")
     if args.command == "exec":
         argv = list(args.command_argv or [])
@@ -944,7 +1166,13 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = prepare_args(parser, parser.parse_args(argv))
-    result = args.func(args)
+    try:
+        result = args.func(args)
+    except RuntimeError as exc:
+        print(f"[orbit] error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
     return int(result or 0)
 
 

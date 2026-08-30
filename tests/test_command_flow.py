@@ -307,9 +307,17 @@ def test_client_foreground_prompt_can_approve_join_request(tmp_path):
     )
     service._dispatch_event(client, join_event.kind, join_event.payload)
 
-    completed = client.get(f"/api/join-requests/{pending['request_id']}")
-    assert completed.status_code == 200
-    payload = completed.json()
+    # Approval now runs on a worker thread so the event loop can never block on
+    # a prompt; poll briefly for the outcome.
+    deadline = time.time() + 5.0
+    payload = {}
+    while time.time() < deadline:
+        completed = client.get(f"/api/join-requests/{pending['request_id']}")
+        assert completed.status_code == 200
+        payload = completed.json()
+        if payload["status"] == "approved":
+            break
+        time.sleep(0.05)
     assert payload["status"] == "approved"
     assert payload["member_token"]
 

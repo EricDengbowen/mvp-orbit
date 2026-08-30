@@ -139,7 +139,9 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
     cleanup_enabled = os.getenv("ORBIT_CHANNEL_CLEANUP_ENABLED", "1").lower() not in {"0", "false", "no"}
     cleanup_interval_sec = float(os.getenv("ORBIT_CHANNEL_CLEANUP_INTERVAL_SEC", "60"))
     client_offline_sec = float(os.getenv("ORBIT_CLIENT_OFFLINE_SEC", "90"))
-    channel_empty_ttl_sec = float(os.getenv("ORBIT_CHANNEL_EMPTY_TTL_SEC", "3600"))
+    # 7 days (was 1 hour): a member whose machines are briefly all offline must
+    # not lose the channel, its members, and every token with it.
+    channel_empty_ttl_sec = float(os.getenv("ORBIT_CHANNEL_EMPTY_TTL_SEC", "604800"))
     claim_timeout_sec = float(os.getenv("ORBIT_CLAIM_TIMEOUT_SEC", "30"))
 
     async def _channel_cleanup_loop() -> None:
@@ -447,7 +449,19 @@ def main() -> None:
     port = int(os.getenv("ORBIT_HUB_PORT", "8080"))
     access_log = os.getenv("ORBIT_ACCESS_LOG", "0").lower() in {"1", "true", "yes"}
     log_kv(logging.getLogger(__name__), logging.INFO, "host.start", bind=f"{host}:{port}", db=os.getenv("ORBIT_HUB_DB", "./.orbit-hub/hub.sqlite3"))
-    uvicorn.run(create_app(), host=host, port=port, reload=False, log_config=None, access_log=access_log)
+    # Without a graceful-shutdown bound, open SSE streams keep the dying server
+    # draining forever: it refuses new connections yet keepalives old clients,
+    # which then look "connected" to a hub that can no longer take work.
+    graceful = int(os.getenv("ORBIT_GRACEFUL_SHUTDOWN_SEC", "10"))
+    uvicorn.run(
+        create_app(),
+        host=host,
+        port=port,
+        reload=False,
+        log_config=None,
+        access_log=access_log,
+        timeout_graceful_shutdown=graceful,
+    )
 
 
 if __name__ == "__main__":

@@ -240,7 +240,9 @@ class ClientRuntime:
                 transfer_id=transfer_id,
                 status=FileTransferStatus.SUCCEEDED,
                 direction="push",
-                remote_path=remote_path,
+                # Report where the file actually landed; a relative path is
+                # ambiguous when the client's workspace root can differ per run.
+                remote_path=str(path),
                 size=len(data),
             )
         except Exception as exc:
@@ -272,7 +274,7 @@ class ClientRuntime:
                 transfer_id=transfer_id,
                 status=FileTransferStatus.SUCCEEDED,
                 direction="pull",
-                remote_path=remote_path,
+                remote_path=str(path),
                 size=len(data),
                 data_b64=base64.b64encode(data).decode("ascii"),
             )

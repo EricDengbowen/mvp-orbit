@@ -246,6 +246,7 @@ class HubStore:
         # Databases created before these columns existed are upgraded in place.
         for statement in (
             "ALTER TABLE commands ADD COLUMN claim_timeout_sec INTEGER",
+            "ALTER TABLE clients ADD COLUMN stream_connected INTEGER",
         ):
             try:
                 self._conn.execute(statement)
@@ -715,7 +716,14 @@ class HubStore:
                 payload = dict(item.payload)
                 if kind == "client.heartbeat":
                     now = utc_now().isoformat()
-                    self._conn.execute("UPDATE clients SET last_seen_at = ? WHERE client_id = ?", (now, client_id))
+                    stream_connected = payload.get("stream_connected")
+                    if stream_connected is None:
+                        self._conn.execute("UPDATE clients SET last_seen_at = ? WHERE client_id = ?", (now, client_id))
+                    else:
+                        self._conn.execute(
+                            "UPDATE clients SET last_seen_at = ?, stream_connected = ? WHERE client_id = ?",
+                            (now, 1 if stream_connected else 0, client_id),
+                        )
                     continue
                 if kind == "command.started":
                     self._append_command_event_locked(payload["command_id"], kind, payload)
@@ -1208,7 +1216,14 @@ class HubStore:
 
     @staticmethod
     def _row_to_client(row: dict) -> ClientRecord:
-        return ClientRecord(client_id=row["client_id"], channel_id=row["channel_id"], created_at=_parse_dt(row["created_at"]), last_seen_at=_parse_dt(row["last_seen_at"]))
+        stream_connected = row.get("stream_connected")
+        return ClientRecord(
+            client_id=row["client_id"],
+            channel_id=row["channel_id"],
+            created_at=_parse_dt(row["created_at"]),
+            last_seen_at=_parse_dt(row["last_seen_at"]),
+            stream_connected=None if stream_connected is None else bool(stream_connected),
+        )
 
     @staticmethod
     def _row_to_join_approval(row: dict) -> JoinApprovalRecord:

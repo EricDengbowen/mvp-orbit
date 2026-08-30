@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
@@ -26,6 +28,24 @@ from mvp_orbit.core.models import (
 logger = logging.getLogger(__name__)
 
 
+def state_dir() -> Path | None:
+    override = os.getenv("ORBIT_STATE_DIR")
+    if override:
+        return Path(override).expanduser()
+    home = Path.home()
+    if not home.exists():
+        return None
+    return home / ".local" / "state" / "mvp-orbit"
+
+
+def status_file_path(client_id: str) -> Path | None:
+    root = state_dir()
+    if root is None:
+        return None
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in client_id)
+    return root / f"status-{safe}.json"
+
+
 class TokenExpiredError(RuntimeError):
     pass
 
@@ -36,6 +56,11 @@ class TokenRejectedError(RuntimeError):
 
 class StreamFailureLimitError(RuntimeError):
     pass
+
+
+class StreamUnusableError(Exception):
+    """The event stream still delivers keepalives, but the hub rejects our
+    POSTs — a half-dead hub (e.g. draining during shutdown). Reconnect."""
 
 
 @dataclass
@@ -79,6 +104,19 @@ class ClientService:
         self._shell_controls: dict[str, _ShellControl] = {}
         self._last_event_id = 0
         self._stream_connected = False
+        self._stream_last_activity = 0.0
+        self._last_stream_error: str | None = None
+        self._connected_at: float | None = None
+        self._started_at = time.time()
+        self._join_prompt_lock = threading.Lock()
+        self._join_prompts_active: set[str] = set()
+        self._stream_unusable = threading.Event()
+
+    def stream_healthy(self) -> bool:
+        # Connected AND recently active. The hub keepalives at least every 5s,
+        # so 30s of silence means the loop is stuck or the connection is dead —
+        # this is what stops last_seen_at from lying about a deaf client.
+        return self._stream_connected and (time.monotonic() - self._stream_last_activity) < 30.0
 
     def _headers(self, *, accept: str = "application/json") -> dict[str, str]:
         headers = {"Accept": accept}
@@ -87,7 +125,11 @@ class ClientService:
         return headers
 
     def run_forever(self, client: httpx.Client | None = None) -> None:
-        timeout = httpx.Timeout(connect=5.0, read=None, write=10.0, pool=10.0)
+        # The hub keepalives the event stream at least every ~5s, so a finite
+        # read timeout only fires when the connection is genuinely dead. An
+        # infinite read here meant a hub that died without closing the socket
+        # left the client hanging silently forever.
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
         own_client = client is None
         stop_heartbeat = threading.Event()
         heartbeat_thread = threading.Thread(target=self._heartbeat_loop, args=(stop_heartbeat,), daemon=True)
@@ -110,13 +152,15 @@ class ClientService:
                         "hub rejected the member token (client evicted or channel pruned) — "
                         "run `orbit join --no-start` on this machine to re-enroll, then restart the client"
                     ) from exc
-                except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+                except (httpx.RequestError, httpx.HTTPStatusError, StreamUnusableError) as exc:
                     # A failure that follows an established stream starts a new
                     # streak; only never-connecting attempts accumulate. This is
                     # what lets a supervisor take over when the network
                     # environment itself has gone bad (e.g. a proxy now
                     # answering 403), instead of retrying it forever.
                     consecutive_failures = 1 if self._stream_connected else consecutive_failures + 1
+                    self._last_stream_error = f"{exc.__class__.__name__}: {exc}"
+                    self._write_status_file()
                     log_kv(
                         logger,
                         logging.WARNING,
@@ -143,12 +187,28 @@ class ClientService:
     def _heartbeat_loop(self, stop: threading.Event) -> None:
         interval = max(1.0, float(self.heartbeat_interval_sec))
         timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+        consecutive_failures = 0
         with httpx.Client(timeout=timeout) as client:
             while not stop.is_set():
+                # The heartbeat reports the event stream's health instead of
+                # pretending everything is fine: last_seen_at then means "the
+                # process is alive", stream_connected means "it can take work".
                 try:
-                    self._post_client_events(client, [ClientEvent(kind="client.heartbeat", payload={})])
+                    self._post_client_events(
+                        client,
+                        [ClientEvent(kind="client.heartbeat", payload={"stream_connected": self.stream_healthy()})],
+                    )
+                    consecutive_failures = 0
                 except Exception as exc:
-                    log_kv(logger, logging.DEBUG, "client.heartbeat_failed", client_id=self.client_id, error=exc.__class__.__name__, detail=exc)
+                    consecutive_failures += 1
+                    level = logging.WARNING if consecutive_failures >= 3 else logging.DEBUG
+                    log_kv(logger, level, "client.heartbeat_failed", client_id=self.client_id, error=exc.__class__.__name__, detail=exc, failures=consecutive_failures)
+                    if consecutive_failures >= 3 and self._stream_connected:
+                        # Keepalives still flow but POSTs fail: a half-dead hub.
+                        # Force the consume loop to reconnect instead of sitting
+                        # on a stream that can never carry work.
+                        self._stream_unusable.set()
+                self._write_status_file()
                 stop.wait(interval)
 
     def _consume_stream(self, client: httpx.Client) -> None:
@@ -162,8 +222,17 @@ class ClientService:
         ) as response:
             self._raise_for_status(response)
             self._stream_connected = True
+            self._stream_last_activity = time.monotonic()
+            self._connected_at = time.time()
+            self._last_stream_error = None
+            self._write_status_file()
+            log_kv(logger, logging.INFO, "client.stream_connected", client_id=self.client_id)
             block: list[str] = []
             for line in response.iter_lines():
+                if self._stream_unusable.is_set():
+                    self._stream_unusable.clear()
+                    raise StreamUnusableError("stream delivers keepalives but hub rejects posts")
+                self._stream_last_activity = time.monotonic()
                 if line == "":
                     event = self._parse_sse_block(block)
                     block = []
@@ -236,30 +305,43 @@ class ClientService:
             thread.start()
             return
         if kind == "join.request":
-            self._handle_join_request(client, payload)
+            # Never block the SSE consume loop on a human answer: a prompt
+            # sitting in input() used to deafen the client for hours while its
+            # heartbeat kept claiming it was online.
+            request_id = str(payload.get("request_id") or "")
+            if not request_id:
+                log_kv(logger, logging.WARNING, "join_request.malformed", client_id=self.client_id, payload=payload)
+                return
+            if request_id in self._join_prompts_active:
+                return
+            self._join_prompts_active.add(request_id)
+            thread = threading.Thread(target=self._handle_join_request, args=(client, payload), daemon=True)
+            thread.start()
             return
         log_kv(logger, logging.WARNING, "control.unknown", client_id=self.client_id, kind=kind)
 
     def _handle_join_request(self, client: httpx.Client, payload: dict) -> None:
         request_id = str(payload.get("request_id") or "")
         alias = str(payload.get("alias") or "")
-        if not request_id:
-            log_kv(logger, logging.WARNING, "join_request.malformed", client_id=self.client_id, payload=payload)
-            return
+        try:
+            with self._join_prompt_lock:  # one prompt on the terminal at a time
+                decision = self._prompt_join_request(payload)
+            if decision is None:
+                log_kv(logger, logging.INFO, "join_request.pending", client_id=self.client_id, request_id=request_id, alias=alias or "-", action=f"orbit approve {request_id}")
+                return
 
-        decision = self._prompt_join_request(payload)
-        if decision is None:
-            log_kv(logger, logging.INFO, "join_request.pending", client_id=self.client_id, request_id=request_id, alias=alias or "-", action=f"orbit approve {request_id}")
-            return
-
-        action = "approve" if decision else "reject"
-        response = client.post(
-            f"{self.hub_url}/api/join-requests/{request_id}/{action}",
-            headers=self._headers(),
-        )
-        self._raise_for_status(response)
-        status_text = "approved" if decision else "rejected"
-        print(f"[orbit] join request {request_id} {status_text}", file=sys.stderr, flush=True)
+            action = "approve" if decision else "reject"
+            response = client.post(
+                f"{self.hub_url}/api/join-requests/{request_id}/{action}",
+                headers=self._headers(),
+            )
+            self._raise_for_status(response)
+            status_text = "approved" if decision else "rejected"
+            print(f"[orbit] join request {request_id} {status_text}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            log_kv(logger, logging.WARNING, "join_request.failed", client_id=self.client_id, request_id=request_id, error=exc.__class__.__name__, detail=exc)
+        finally:
+            self._join_prompts_active.discard(request_id)
 
     def _prompt_join_request(self, payload: dict) -> bool | None:
         if self.join_request_prompt is not None:
@@ -414,6 +496,31 @@ class ClientService:
             json=ClientEventsRequest(events=events).model_dump(mode="json"),
         )
         self._raise_for_status(response)
+
+    def _write_status_file(self) -> None:
+        # Local self-diagnosis (read by `orbit status`): answers "is my own
+        # client connected?" without needing a member token or another machine.
+        path = status_file_path(self.client_id)
+        if path is None:
+            return
+        payload = {
+            "client_id": self.client_id,
+            "hub_url": self.hub_url,
+            "pid": os.getpid(),
+            "started_at": self._started_at,
+            "connected_at": self._connected_at,
+            "stream_connected": self.stream_healthy(),
+            "last_stream_error": self._last_stream_error,
+            "workspace": str(getattr(self.runtime, "base_workspace", "")),
+            "updated_at": time.time(),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
 
     @staticmethod
     def _parse_sse_block(block: list[str]) -> dict | None:
