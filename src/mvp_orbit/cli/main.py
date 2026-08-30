@@ -1209,6 +1209,38 @@ def cmd_daemon_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Stop this machine's daemon cleanly (SIGTERM to the supervisor, which
+    removes its own pidfile on the way out)."""
+    config_path, _ = load_config(args.config)
+    _, pid_path = _daemon_paths(str(config_path))
+    if not pid_path.exists():
+        print("[orbit] no daemon pidfile found — nothing to stop (this machine's client was not started with --daemon, or it already exited)")
+        return 1
+    content = pid_path.read_text().strip()
+    try:
+        pid = int(content)
+    except ValueError:
+        print(f"[orbit] pidfile {pid_path} holds no pid ({content!r}) — a daemon may still be starting; retry shortly")
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pid_path.unlink(missing_ok=True)
+        print(f"[orbit] daemon (pid {pid}) was already gone; removed the stale pidfile")
+        return 0
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print(f"[orbit] daemon stopped (pid {pid}). Bring this machine back online with `orbit join --daemon`.")
+            return 0
+        time.sleep(0.2)
+    print(f"[orbit] daemon (pid {pid}) did not exit within 10s — inspect it, or force with `kill -9 {pid}`")
+    return 1
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from mvp_orbit.client.service import status_file_path
 
@@ -1310,7 +1342,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,doctor,members,leave,remove,transfer-admin,renew}",
+        metavar="{host,join,join-requests,approve,reject,peers,exec,sh,put,get,status,stop,doctor,members,leave,remove,transfer-admin,renew}",
     )
 
     host = sub.add_parser("host", help="start the control host")
@@ -1330,6 +1362,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     renew = sub.add_parser("renew", help="swap the saved member token for a fresh 7-day one (needs the current token to still be valid)")
     renew.set_defaults(func=cmd_renew)
+
+    stop = sub.add_parser("stop", help="stop this machine's daemon (started with `orbit join --daemon`)")
+    stop.set_defaults(func=cmd_stop)
 
     status = sub.add_parser("status", help="show this machine's client state (local, no token needed)")
     status.add_argument("--client-id", default=None)

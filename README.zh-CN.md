@@ -174,6 +174,7 @@ orbit sh <peer>
 orbit put <peer> <local> <remote>
 orbit get <peer> <remote> <local>
 orbit status                   # 本机 client 健康状况，无需 token
+orbit stop                     # 停止本机的守护进程
 orbit doctor <peer>            # 用探针命令诊断远端
 orbit members                  # 列出成员、角色和在线状态
 orbit leave                    # 退出 channel 并吊销本机凭据

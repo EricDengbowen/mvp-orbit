@@ -174,6 +174,7 @@ orbit sh <peer>
 orbit put <peer> <local> <remote>
 orbit get <peer> <remote> <local>
 orbit status                   # local client health, no token needed
+orbit stop                     # stop this machine's daemon
 orbit doctor <peer>            # remote diagnosis with a probe command
 orbit members                  # list members, roles, liveness
 orbit leave                    # leave the channel, revoke own credentials

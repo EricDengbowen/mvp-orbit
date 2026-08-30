@@ -114,3 +114,37 @@ def test_file_results_report_absolute_paths(tmp_path):
 
     pulled = runtime.handle_file_pull(transfer_id="t2", remote_path="inbox/x.txt", max_bytes=100)
     assert pulled.remote_path == result.remote_path
+
+
+def test_orbit_stop_terminates_daemon_and_handles_stale_pidfile(tmp_path, monkeypatch, capsys):
+    import subprocess
+
+    from mvp_orbit.cli import main as cli_main
+    from mvp_orbit.config import ClientConfig, OrbitConfig, save_config
+
+    monkeypatch.setenv("ORBIT_STATE_DIR", str(tmp_path / "state"))
+    config_path = tmp_path / "config.toml"
+    save_config(OrbitConfig(client=ClientConfig(id="me")), config_path)
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+
+    # No pidfile yet.
+    assert cli_main.main(["stop"]) == 1
+    assert "nothing to stop" in capsys.readouterr().out
+
+    # A live fake daemon gets terminated. Reap it concurrently: a real
+    # daemon is not our child, but this sleeper is, and an unreaped zombie
+    # would still answer kill -0.
+    proc = subprocess.Popen(["sleep", "60"])
+    reaper = threading.Thread(target=proc.wait, daemon=True)
+    reaper.start()
+    (tmp_path / "state").mkdir(exist_ok=True)
+    pidfile = tmp_path / "state" / "daemon-me.pid"
+    pidfile.write_text(str(proc.pid))
+    assert cli_main.main(["stop"]) == 0
+    reaper.join(timeout=5)
+    assert proc.returncode != 0  # SIGTERM'd
+
+    # Stale pidfile (process already gone) is cleaned up.
+    pidfile.write_text(str(proc.pid))
+    assert cli_main.main(["stop"]) == 0
+    assert not pidfile.exists()
