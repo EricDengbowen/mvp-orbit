@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -43,7 +44,7 @@ from mvp_orbit.core.models import (
     default_join_request_id,
     default_shell_session_id,
 )
-from mvp_orbit.hub.store import AuthenticatedMember, ExpiredTokenError, HubStore, InvalidTokenError, MembershipError
+from mvp_orbit.hub.store import AliasInUseError, AuthenticatedMember, ExpiredTokenError, HubStore, InvalidTokenError, MembershipError
 
 LANDING_PAGE_HTML = """<!doctype html>
 <html lang="en">
@@ -185,36 +186,59 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
 
     app = FastAPI(title="mvp-orbit-host", version="0.5.0", lifespan=lifespan)
 
+    # Clients and the CLI treat 30s of silence as a dead connection, so the
+    # stream must carry SOMETHING at least this often. The keepalive is driven
+    # by the clock: it used to be sent only when the whole hub had been idle
+    # for 5s, and every heartbeat from any client counted as activity, so with
+    # a handful of clients online no keepalive was ever sent and every stream
+    # was cut and reconnected over and over.
+    keepalive_sec = max(0.05, float(os.getenv("ORBIT_STREAM_KEEPALIVE_SEC", "5")))
+
     async def _client_stream(request: Request, client_id: str):
         last_event_id = _last_event_id(request)
+        last_sent = time.monotonic()
         while True:
-            events = store.get_client_control_events(client_id, last_event_id)
+            seen_version = store.update_version()
+            events, scanned = await asyncio.to_thread(store.get_live_client_control_events, client_id, last_event_id)
+            # Skip past dropped (stale) events for good, not on every wakeup.
+            last_event_id = max(last_event_id, scanned)
             if events:
                 for event in events:
                     yield _format_sse(event.event_id, event.kind, event.payload)
-                    last_event_id = event.event_id
+                last_sent = time.monotonic()
                 continue
             if await request.is_disconnected():
                 break
-            if not await asyncio.to_thread(store.wait_for_updates, 5.0):
+            remaining = keepalive_sec - (time.monotonic() - last_sent)
+            if remaining <= 0:
                 yield b": keepalive\n\n"
+                last_sent = time.monotonic()
+                continue
+            await store.wait_for_update_async(seen_version, remaining)
 
     async def _record_stream(request: Request, list_events, get_record, terminal_statuses: set):
         last_event_id = _last_event_id(request)
+        last_sent = time.monotonic()
         while True:
-            events = list_events(last_event_id)
+            seen_version = store.update_version()
+            events = await asyncio.to_thread(list_events, last_event_id)
             if events:
                 for event in events:
                     yield _format_sse(event.event_id, event.kind, event.payload)
                     last_event_id = event.event_id
+                last_sent = time.monotonic()
                 continue
-            record = get_record()
+            record = await asyncio.to_thread(get_record)
             if record is None or record.status in terminal_statuses:
                 break
             if await request.is_disconnected():
                 break
-            if not await asyncio.to_thread(store.wait_for_updates, 5.0):
+            remaining = keepalive_sec - (time.monotonic() - last_sent)
+            if remaining <= 0:
                 yield b": keepalive\n\n"
+                last_sent = time.monotonic()
+                continue
+            await store.wait_for_update_async(seen_version, remaining)
 
     @app.get("/", response_class=HTMLResponse)
     def landing_page() -> HTMLResponse:
@@ -226,7 +250,17 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
 
     @app.post("/api/join", response_model=JoinResponse)
     def join(request: JoinRequest) -> JoinResponse:
-        return store.request_channel_join(request_id=default_join_request_id(), alias=request.alias, channel=request.channel)
+        try:
+            return store.request_channel_join(request_id=default_join_request_id(), alias=request.alias, channel=request.channel)
+        except AliasInUseError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"alias '{request.alias}' is already the client id of a machine in another channel on this hub. "
+                    "Aliases double as hub-wide client ids: join again with a unique alias (for example add your user id), "
+                    "or if that machine is yours, run `orbit leave` on it first."
+                ),
+            ) from exc
 
     @app.get("/api/join-requests/{request_id}", response_model=JoinResponse)
     def get_join_request(
@@ -326,7 +360,10 @@ def create_app(*, store: HubStore | None = None) -> FastAPI:
         try:
             store.register_client(client_id, member.channel_id)
         except MembershipError as exc:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden") from exc
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"client id '{client_id}' belongs to another channel on this hub - leave and join again with a unique alias",
+            ) from exc
         return StreamingResponse(_client_stream(request, client_id), media_type="text/event-stream", headers=_sse_headers())
 
     @app.post("/api/clients/{client_id}/events")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -47,6 +48,10 @@ class InvalidTokenError(Exception):
     pass
 
 
+class AliasInUseError(Exception):
+    """The alias is already the client id of a machine in another channel."""
+
+
 class ExpiredTokenError(Exception):
     pass
 
@@ -74,6 +79,11 @@ class HubStore:
         self.commands_root.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
         self._updates = Condition()
+        # Event-loop waiters for wait_for_update_async. Kept separate from the
+        # Condition above so an open SSE stream parks no thread while it waits.
+        self._update_version = 0
+        self._update_waiters: set[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = set()
+        self._update_waiters_lock = Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -284,9 +294,48 @@ class HubStore:
         with self._updates:
             return self._updates.wait(timeout=timeout)
 
+    def update_version(self) -> int:
+        """Counter bumped by every store change.
+
+        Read it BEFORE querying for new events and hand it to
+        ``wait_for_update_async``: a change that lands between the query and
+        the wait then returns immediately instead of being slept through.
+        """
+        return self._update_version
+
+    async def wait_for_update_async(self, seen_version: int, timeout: float) -> bool:
+        """Wait on the event loop until the store changes or ``timeout`` passes.
+
+        Returns True when a change happened. Unlike ``wait_for_updates`` this
+        parks no thread, so the number of open streams is not capped by the
+        size of asyncio's default executor.
+        """
+        loop = asyncio.get_running_loop()
+        event = asyncio.Event()
+        entry = (loop, event)
+        with self._update_waiters_lock:
+            if self._update_version != seen_version:
+                return True
+            self._update_waiters.add(entry)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, timeout))
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            with self._update_waiters_lock:
+                self._update_waiters.discard(entry)
+
     def request_channel_join(self, *, request_id: str, alias: str, channel: str) -> JoinResponse:
         channel_id = self.channel_id_for_name(channel)
         with self._lock, self._conn:
+            # Client ids are global on the hub while aliases are only unique
+            # per channel. Letting this join through would hand out a token
+            # whose every stream connect is then refused (403) forever.
+            owner = self._conn.execute("SELECT channel_id FROM clients WHERE client_id = ?", (alias,)).fetchone()
+            if owner is not None and str(owner["channel_id"]) != channel_id:
+                log_kv(logger, logging.WARNING, "join.alias_in_use", channel_id=channel_id, alias=alias)
+                raise AliasInUseError(alias)
             if self._channel_member_count_locked(channel_id) == 0:
                 self._insert_channel_member_locked(channel_id, alias, role="admin")
                 token = self._issue_token_locked(channel_id, alias=alias)
@@ -738,6 +787,66 @@ class HubStore:
             )
             for row in rows
         ]
+
+    def get_live_client_control_events(self, client_id: str, after_seq: int) -> tuple[list[ClientControlEvent], int]:
+        """Control events after ``after_seq`` that still matter, plus the
+        highest seq examined (so the caller can skip the dropped ones for good).
+
+        A client that restarts connects without Last-Event-ID and used to get
+        its ENTIRE history back: every join request ever raised, approved and
+        rejected ones included, and a ``command.start`` for every command it
+        ever ran, each costing the client a thread and a doomed claim request.
+        Two kinds are dropped, and only when the hub positively knows the event
+        can no longer lead to work:
+          - ``join.request``  whose request is no longer pending
+          - ``command.start`` whose command is no longer queued
+        Cancels, shell and file events are delivered exactly as before.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT seq, kind, payload_json, created_at
+                FROM client_control_events
+                WHERE client_id = ? AND seq > ?
+                ORDER BY seq ASC
+                """,
+                (client_id, after_seq),
+            ).fetchall()
+            if not rows:
+                return [], after_seq
+            pending_joins = {
+                str(row["request_id"])
+                for row in self._conn.execute(
+                    "SELECT request_id FROM join_requests WHERE status = ?",
+                    (JoinRequestStatus.PENDING.value,),
+                )
+            }
+            queued_commands = {
+                str(row["command_id"])
+                for row in self._conn.execute(
+                    "SELECT command_id FROM commands WHERE client_id = ? AND status = ?",
+                    (client_id, CommandStatus.QUEUED.value),
+                )
+            }
+        scanned = int(rows[-1]["seq"])
+        events: list[ClientControlEvent] = []
+        for row in rows:
+            kind = str(row["kind"])
+            payload = json.loads(str(row["payload_json"]))
+            if kind == "join.request" and str(payload.get("request_id")) not in pending_joins:
+                continue
+            if kind == "command.start" and str(payload.get("command_id")) not in queued_commands:
+                continue
+            events.append(
+                ClientControlEvent(
+                    event_id=int(row["seq"]),
+                    client_id=client_id,
+                    kind=kind,
+                    payload=payload,
+                    created_at=_parse_dt(row["created_at"]),
+                )
+            )
+        return events, scanned
 
     def get_command_events(self, command_id: str, after_seq: int) -> list[EventRecord]:
         return self._list_events("command_events", "command_id", command_id, after_seq)
@@ -1350,6 +1459,16 @@ class HubStore:
     def _notify_update(self) -> None:
         with self._updates:
             self._updates.notify_all()
+        with self._update_waiters_lock:
+            self._update_version += 1
+            waiters = list(self._update_waiters)
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # That waiter's event loop has already closed.
+                with self._update_waiters_lock:
+                    self._update_waiters.discard((loop, event))
 
     def _append_client_control_event_locked(self, client_id: str, kind: str, payload: dict) -> ClientControlEvent:
         now = utc_now()
